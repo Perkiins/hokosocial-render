@@ -1,66 +1,29 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, session
-from threads_bot_ejecucion import ejecutar_bot_una_vez  # <- corregido
+from flask import Flask, jsonify
+import threading
+import time
+import logging
+import threads_bot_ejecucion
 
 app = Flask(__name__)
-import os
-app.secret_key = os.getenv('SECRET_KEY', 'clave_por_defecto_para_dev')
+logging.basicConfig(level=logging.INFO)
 
-users = {
-    'maax': {'password': '1234', 'tokens': 10}
-}
+bot_thread = None
 
-@app.route('/')
-def index():
-    if 'username' in session:
-        return redirect(url_for('panel'))
-    return redirect(url_for('login'))
+def run_bot_periodically():
+    while True:
+        success, msg = threads_bot_ejecucion.ejecutar_bot_una_vez()
+        logging.info(f"Bot run: {msg}")
+        time.sleep(60 * 30)  # Corre cada 30 minutos
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        user = users.get(username)
-        if user and user['password'] == password:
-            session['username'] = username
-            flash('Login exitoso!', 'success')
-            return redirect(url_for('panel'))
-        else:
-            flash('Usuario o contraseña incorrectos.', 'error')
-    return render_template('login.html')
+@app.route("/")
+def home():
+    return "ThreadsFollower bot activo."
 
-@app.route('/panel')
-def panel():
-    if 'username' not in session:
-        return redirect(url_for('login'))
-    username = session['username']
-    tokens = users[username]['tokens']
-    return render_template('panel.html', tokens=tokens)
+@app.route("/healthz")
+def health():
+    return jsonify({"status": "ok"})
 
-@app.route('/usar_token', methods=['POST'])
-def usar_token():
-    if 'username' not in session:
-        return redirect(url_for('login'))
-    username = session['username']
-    user = users[username]
-
-    if user['tokens'] > 0:
-        exito, mensaje = ejecutar_bot_una_vez()  # llama directamente, sin reimportar
-        if exito:
-            user['tokens'] -= 1
-            flash(mensaje, 'success')
-        else:
-            flash(f"Error: {mensaje}", 'error')
-    else:
-        flash('No tienes tokens suficientes.', 'error')
-
-    return redirect(url_for('panel'))
-
-@app.route('/logout')
-def logout():
-    session.pop('username', None)
-    flash('Has cerrado sesión.', 'info')
-    return redirect(url_for('login'))
-
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    bot_thread = threading.Thread(target=run_bot_periodically, daemon=True)
+    bot_thread.start()
+    app.run(host="0.0.0.0", port=8080)
