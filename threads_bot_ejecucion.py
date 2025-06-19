@@ -1,13 +1,12 @@
 import logging
 from logging.handlers import RotatingFileHandler
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
-from webdriver_manager.chrome import ChromeDriverManager
 import time
 import random
 import os
@@ -152,17 +151,15 @@ def buscar_perfiles(driver, cantidad=100):
         return []
 
 def ejecutar_bot_una_vez():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.binary_location = "/usr/bin/chromium"
+    firefox_options = Options()
+    firefox_options.headless = True
+    firefox_options.add_argument("--no-sandbox")
+    firefox_options.add_argument("--disable-dev-shm-usage")
 
-    driver = webdriver.Chrome(
-        service=ChromeService("/usr/bin/chromedriver"),
-        options=chrome_options
-    )
+    # Ajusta la ruta a geckodriver si hace falta; normalmente está en PATH en Render
+    service = FirefoxService()
+
+    driver = webdriver.Firefox(service=service, options=firefox_options)
 
     if os.path.exists("seguidos.txt"):
         with open("seguidos.txt", "r", encoding="utf-8") as f:
