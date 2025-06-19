@@ -151,14 +151,13 @@ def buscar_perfiles(driver, cantidad=100):
         return []
 
 def ejecutar_bot():
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")
-
-    service = FirefoxService()  # Usa el geckodriver en PATH (instalado en Dockerfile)
-    driver = webdriver.Firefox(service=service, options=options)
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Modo headless (sin ventana)
+    chrome_options.add_argument("--no-sandbox")  # Necesario en Linux cloud
+    chrome_options.add_argument("--disable-dev-shm-usage")  # Para evitar problemas memoria
+    chrome_options.add_argument("--disable-gpu")  # Opcional para headless en algunos sistemas
+    chrome_options.add_argument("--window-size=1920,1080")
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
 
     if os.path.exists("seguidos.txt"):
         with open("seguidos.txt", "r", encoding="utf-8") as f:
@@ -194,6 +193,7 @@ def ejecutar_bot():
     finally:
         driver.quit()
         logger.info("Driver cerrado y script finalizado.")
+
 
 if __name__ == "__main__":
     logger.info("Iniciando el script...")
