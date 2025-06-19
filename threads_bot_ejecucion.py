@@ -157,7 +157,8 @@ def ejecutar_bot():
     chrome_options.add_argument("--disable-dev-shm-usage")  # Para evitar problemas memoria
     chrome_options.add_argument("--disable-gpu")  # Opcional para headless en algunos sistemas
     chrome_options.add_argument("--window-size=1920,1080")
-    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
+
+    driver = webdriver.Firefox(service=FirefoxService(), options=chrome_options)
 
     if os.path.exists("seguidos.txt"):
         with open("seguidos.txt", "r", encoding="utf-8") as f:
