@@ -45,7 +45,8 @@ def usar_token():
     user = users[username]
 
     if user['tokens'] > 0:
-        exito, mensaje = ejecutar_bot()
+        from threads_bot_ejecucion import ejecutar_bot_una_vez
+        exito, mensaje = ejecutar_bot_una_vez()
         if exito:
             user['tokens'] -= 1
             flash(mensaje, 'success')
