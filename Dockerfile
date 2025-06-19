@@ -1,10 +1,8 @@
 FROM python:3.13-slim
 
-# Variables de entorno necesarias para Chrome Headless
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CHROME_BIN=/usr/bin/google-chrome
 
-# Instala dependencias del sistema necesarias
 RUN apt-get update && apt-get install -y \
     wget \
     curl \
@@ -28,24 +26,19 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
-# Instala Google Chrome
+# Instala Google Chrome y crea el alias correcto
 RUN wget -q -O google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
     apt-get update && apt-get install -y ./google-chrome.deb && \
     rm google-chrome.deb && \
-    ln -s /usr/bin/google-chrome-stable /usr/bin/google-chrome  # <--- ESTA ES LA LÍNEA CLAVE
+    ln -sf /usr/bin/google-chrome-stable /usr/bin/google-chrome
 
-# Establece el directorio de trabajo
 WORKDIR /app
 
-# Copia e instala dependencias de Python
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia el código de la app
 COPY . /app
 
-# Expone el puerto
 EXPOSE 5000
 
-# Comando para arrancar la app
 CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app"]
