@@ -1,12 +1,15 @@
 FROM python:3.13-slim
-RUN apt-get update && apt-get install -y wget gnupg2
-RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add -
-RUN sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
-RUN apt-get update && apt-get install -y google-chrome-stable
-# Instalar dependencias de sistema necesarias para Chrome y gunicorn
+
+# Variables de entorno necesarias para Chrome Headless
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CHROME_BIN=/usr/bin/google-chrome
+
+# Instala dependencias del sistema necesarias
 RUN apt-get update && apt-get install -y \
     wget \
+    curl \
     gnupg2 \
+    unzip \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -22,24 +25,26 @@ RUN apt-get update && apt-get install -y \
     libnss3 \
     libxshmfence1 \
     xdg-utils \
-    && rm -rf /var/lib/apt/lists/*
-
-# Añadir repo de Chrome e instalar
-RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - && \
-    echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list && \
-    apt-get update && apt-get install -y google-chrome-stable && \
+    --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
-# Establecer directorio de trabajo
+# Instala Google Chrome
+RUN wget -q -O google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
+    apt-get update && apt-get install -y ./google-chrome.deb && \
+    rm google-chrome.deb
+
+# Establece el directorio de trabajo
 WORKDIR /app
 
-# Copiar requirements y código
+# Copia e instala dependencias de Python
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia el código de la app
 COPY . /app
 
-# Exponer puerto 5000 (o el que uses)
+# Expone el puerto
 EXPOSE 5000
 
-# Comando para arrancar con gunicorn
+# Comando para arrancar la app
 CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app"]
