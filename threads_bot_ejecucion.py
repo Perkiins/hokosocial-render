@@ -150,53 +150,51 @@ def buscar_perfiles(driver, cantidad=100):
         logger.error(f"Error buscando perfiles: {e}")
         return []
 
-def ejecutar_bot_una_vez():
-    firefox_options = Options()
-    firefox_options.headless = True
-    firefox_options.add_argument("--no-sandbox")
-    firefox_options.add_argument("--disable-dev-shm-usage")
+def ejecutar_bot():
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
 
-    try:
-        driver = webdriver.Firefox(service=FirefoxService(), options=firefox_options)
-    except Exception as e:
-        logger.error(f"No se pudo iniciar Firefox WebDriver: {e}")
-        return False, "Fallo al iniciar Firefox WebDriver"
+    service = FirefoxService()  # Usa el geckodriver en PATH (instalado en Dockerfile)
+    driver = webdriver.Firefox(service=service, options=options)
 
     if os.path.exists("seguidos.txt"):
         with open("seguidos.txt", "r", encoding="utf-8") as f:
             for linea in f:
                 lista_seguidos.add(linea.strip())
+        logger.info(f"Cargados {len(lista_seguidos)} usuarios ya seguidos desde archivo.")
 
     try:
-        candidatos = buscar_perfiles(driver, cantidad=20)
-        random.shuffle(candidatos)
+        while True:
+            candidatos = buscar_perfiles(driver, cantidad=60)
+            random.shuffle(candidatos)
 
-        seguidos_esta_vez = 0
+            for user in candidatos:
+                if user in lista_seguidos:
+                    continue
+                if analizar_perfil(driver, user):
+                    if seguir_usuario(driver, user):
+                        with open("seguidos.txt", "a", encoding="utf-8") as f:
+                            f.write(user + "\n")
+                        logger.info(f"Guardado {user} en seguidos.txt")
+                    else:
+                        logger.info(f"No se pudo seguir a {user}")
 
-        for user in candidatos:
-            if user in lista_seguidos:
-                continue
-            if analizar_perfil(driver, user):
-                if seguir_usuario(driver, user):
-                    with open("seguidos.txt", "a", encoding="utf-8") as f:
-                        f.write(user + "\n")
-                    lista_seguidos.add(user)
-                    seguidos_esta_vez += 1
-                if seguidos_esta_vez >= 3:
-                    break
-            time.sleep(random.uniform(3, 6))
+                time.sleep(random.uniform(3, 6))
 
-        return True, f"Se siguieron {seguidos_esta_vez} usuarios."
+            logger.info("🔁 Volviendo a buscar más perfiles en 'Para ti'...\n")
+            time.sleep(random.uniform(10, 20))
 
+    except KeyboardInterrupt:
+        logger.info("🛑 Script detenido manualmente por el usuario.")
     except Exception as e:
-        logger.error(f"Error en ejecución bot una vez: {e}")
-        return False, str(e)
-
+        logger.error(f"Error en ejecución principal: {e}")
     finally:
         driver.quit()
         logger.info("Driver cerrado y script finalizado.")
 
 if __name__ == "__main__":
     logger.info("Iniciando el script...")
-    ejecutar_bot_una_vez()
-    time.sleep(600)  # ⏸️ Espera para evitar que Render reinicie el bot constantemente
+    ejecutar_bot()
