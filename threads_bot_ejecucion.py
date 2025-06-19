@@ -156,7 +156,10 @@ def ejecutar_bot_una_vez():
     
     # Ruta corregida para Render.com, usar chromium-browser, no google-chrome
     chrome_options.binary_location = "/usr/bin/chromium-browser"
-    driver = webdriver.Chrome(service=ChromeService("/usr/lib/chromium-browser/chromedriver"), options=chrome_options)
+    from webdriver_manager.chrome import ChromeDriverManager
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
     
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
