@@ -10,8 +10,8 @@ RUN apt-get update && apt-get install -y \
     xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-# Instalar geckodriver
-RUN GECKODRIVER_VERSION=0.33.0 \
+# Instalar geckodriver versión 0.36.0
+RUN GECKODRIVER_VERSION=0.36.0 \
     && wget -q "https://github.com/mozilla/geckodriver/releases/download/v${GECKODRIVER_VERSION}/geckodriver-v${GECKODRIVER_VERSION}-linux64.tar.gz" -O /tmp/geckodriver.tar.gz \
     && tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin/ \
     && chmod +x /usr/local/bin/geckodriver \
@@ -24,5 +24,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 5000
 
-# Para que el bot funcione y el server también, usa supervisord o ejecuta solo el bot si solo quieres el bot:
 CMD ["python3", "app.py"]
