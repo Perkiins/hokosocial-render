@@ -1,29 +1,44 @@
-# Usamos imagen base Python 3.13 slim
-FROM python:3.13-slim
+FROM python:3.11-slim
 
-# Instalamos herramientas básicas y Chromium + ChromeDriver
-RUN apt-get update && apt-get install -y \
-    chromium \
-    chromium-driver \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Instalar dependencias del sistema
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        firefox-esr \
+        wget \
+        unzip \
+        curl \
+        ca-certificates \
+        fonts-liberation \
+        libgtk-3-0 \
+        libdbus-glib-1-2 \
+        libasound2 \
+        libxt6 \
+        libxrandr2 \
+        libxss1 \
+        libxcomposite1 \
+        libxcursor1 \
+        libxdamage1 \
+        libxi6 \
+        libnss3 \
+        libx11-xcb1 \
+        libxrender1 \
+        libxext6 \
+        libxfixes3 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Variables para Chrome y ChromeDriver
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROME_DRIVER=/usr/bin/chromedriver
+# Instalar geckodriver
+RUN GECKODRIVER_VERSION=0.33.0 && \
+    wget -q https://github.com/mozilla/geckodriver/releases/download/v$GECKODRIVER_VERSION/geckodriver-v$GECKODRIVER_VERSION-linux64.tar.gz && \
+    tar -xzf geckodriver-v$GECKODRIVER_VERSION-linux64.tar.gz -C /usr/local/bin && \
+    rm geckodriver-v$GECKODRIVER_VERSION-linux64.tar.gz
 
-# Creamos directorio de trabajo
+# Crear directorio de trabajo
 WORKDIR /app
 
-# Copiamos requirements y los instalamos
+# Copiar requirements y código
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiamos todo el código
 COPY . .
 
-# Exponemos el puerto (por defecto flask 5000)
-EXPOSE 5000
-
-# Ejecutamos la app
-CMD ["python", "app.py"]
+CMD ["python3", "threads_bot_ejecucion.py"]
