@@ -1,8 +1,9 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, session
 from threads_bot_ejecucion import ejecutar_bot
+import os
 
 app = Flask(__name__)
-app.secret_key = 'tu_clave_secreta_aqui'
+app.secret_key = os.environ.get('SECRET_KEY', 'tu_clave_secreta_aqui')
 
 users = {
     'maax': {'password': '1234', 'tokens': 10}
@@ -62,4 +63,5 @@ def logout():
     return redirect(url_for('login'))
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # debug=True solo local, para producción ponlo False o elimina
+    app.run(host='0.0.0.0', port=5000, debug=False)
