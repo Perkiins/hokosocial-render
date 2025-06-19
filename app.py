@@ -2,7 +2,8 @@ from flask import Flask, render_template, request, redirect, url_for, flash, ses
 from threads_bot_ejecucion import ejecutar_bot
 
 app = Flask(__name__)
-app.secret_key = 'tu_clave_secreta_aqui'
+import os
+app.secret_key = os.getenv('SECRET_KEY', 'clave_por_defecto_para_dev')
 
 users = {
     'maax': {'password': '1234', 'tokens': 10}
