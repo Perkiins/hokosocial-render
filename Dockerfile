@@ -24,4 +24,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 5000
 
-CMD ["python3", "app.py"]
+CMD ["xvfb-run", "-a", "python3", "app.py"]
