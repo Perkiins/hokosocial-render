@@ -152,14 +152,14 @@ def buscar_perfiles(driver, cantidad=100):
         return []
 
 def ejecutar_bot():
-chrome_options = Options()
-chrome_options.add_argument("--headless")  # Modo headless (sin ventana)
-chrome_options.add_argument("--no-sandbox")  # Necesario en Linux cloud
-chrome_options.add_argument("--disable-dev-shm-usage")  # Para evitar problemas memoria
-chrome_options.add_argument("--disable-gpu")  # Opcional para headless en algunos sistemas
-chrome_options.add_argument("--window-size=1920,1080")
-driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Modo headless (sin ventana)
+    chrome_options.add_argument("--no-sandbox")  # Necesario en Linux cloud
+    chrome_options.add_argument("--disable-dev-shm-usage")  # Para evitar problemas memoria
+    chrome_options.add_argument("--disable-gpu")  # Opcional para headless en algunos sistemas
+    chrome_options.add_argument("--window-size=1920,1080")
 
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
 
     if os.path.exists("seguidos.txt"):
         with open("seguidos.txt", "r", encoding="utf-8") as f:
