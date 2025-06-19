@@ -31,7 +31,8 @@ RUN apt-get update && apt-get install -y \
 # Instala Google Chrome
 RUN wget -q -O google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
     apt-get update && apt-get install -y ./google-chrome.deb && \
-    rm google-chrome.deb
+    rm google-chrome.deb && \
+    ln -s /usr/bin/google-chrome-stable /usr/bin/google-chrome  # <--- ESTA ES LA LÍNEA CLAVE
 
 # Establece el directorio de trabajo
 WORKDIR /app
