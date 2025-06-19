@@ -156,10 +156,11 @@ def ejecutar_bot_una_vez():
     firefox_options.add_argument("--no-sandbox")
     firefox_options.add_argument("--disable-dev-shm-usage")
 
-    # Ajusta la ruta a geckodriver si hace falta; normalmente está en PATH en Render
-    service = FirefoxService()
-
-    driver = webdriver.Firefox(service=service, options=firefox_options)
+    try:
+        driver = webdriver.Firefox(service=FirefoxService(), options=firefox_options)
+    except Exception as e:
+        logger.error(f"No se pudo iniciar Firefox WebDriver: {e}")
+        return False, "Fallo al iniciar Firefox WebDriver"
 
     if os.path.exists("seguidos.txt"):
         with open("seguidos.txt", "r", encoding="utf-8") as f:
@@ -167,7 +168,7 @@ def ejecutar_bot_una_vez():
                 lista_seguidos.add(linea.strip())
 
     try:
-        candidatos = buscar_perfiles(driver, cantidad=20)  # Ajusta si quieres más rápido
+        candidatos = buscar_perfiles(driver, cantidad=20)
         random.shuffle(candidatos)
 
         seguidos_esta_vez = 0
@@ -198,3 +199,4 @@ def ejecutar_bot_una_vez():
 if __name__ == "__main__":
     logger.info("Iniciando el script...")
     ejecutar_bot_una_vez()
+    time.sleep(600)  # ⏸️ Espera para evitar que Render reinicie el bot constantemente
