@@ -153,7 +153,10 @@ def buscar_perfiles(driver, cantidad=100):
 
 def ejecutar_bot_una_vez():
     chrome_options = Options()
-    chrome_options.binary_location = "/usr/bin/google-chrome"
+    
+    # Ruta corregida para Render.com, usar chromium-browser, no google-chrome
+    chrome_options.binary_location = "/usr/bin/chromium-browser"
+    
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
@@ -168,7 +171,7 @@ def ejecutar_bot_una_vez():
                 lista_seguidos.add(linea.strip())
 
     try:
-        candidatos = buscar_perfiles(driver, cantidad=20)  # Menos para respuesta rápida
+        candidatos = buscar_perfiles(driver, cantidad=20)  # Ajusta si quieres más rápido
         random.shuffle(candidatos)
 
         seguidos_esta_vez = 0
@@ -182,7 +185,7 @@ def ejecutar_bot_una_vez():
                         f.write(user + "\n")
                     lista_seguidos.add(user)
                     seguidos_esta_vez += 1
-                if seguidos_esta_vez >= 3:  # Limitar para no usar tokens rápido
+                if seguidos_esta_vez >= 3:
                     break
             time.sleep(random.uniform(3, 6))
 
@@ -198,4 +201,4 @@ def ejecutar_bot_una_vez():
 
 if __name__ == "__main__":
     logger.info("Iniciando el script...")
-    ejecutar_bot()
+    ejecutar_bot_una_vez()
