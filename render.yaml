@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: ThreadsApp
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: |
+      apt-get update && apt-get install -y firefox-esr firefox-geckodriver
+      pip install -r requirements.txt
+    startCommand: python3 threads_bot_ejecucion.py
+    envVars:
+      - key: PORT
+        value: "5000"
