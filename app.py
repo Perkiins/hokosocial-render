@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, session
-from threads_bot_ejecucion import ejecutar_bot
+from threads_bot_ejecucion import ejecutar_bot_una_vez  # <- corregido
 
 app = Flask(__name__)
 import os
@@ -45,8 +45,7 @@ def usar_token():
     user = users[username]
 
     if user['tokens'] > 0:
-        from threads_bot_ejecucion import ejecutar_bot_una_vez
-        exito, mensaje = ejecutar_bot_una_vez()
+        exito, mensaje = ejecutar_bot_una_vez()  # llama directamente, sin reimportar
         if exito:
             user['tokens'] -= 1
             flash(mensaje, 'success')
