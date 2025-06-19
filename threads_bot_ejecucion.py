@@ -151,12 +151,12 @@ def buscar_perfiles(driver, cantidad=100):
         logger.error(f"Error buscando perfiles: {e}")
         return []
 
-def ejecutar_bot():
+def ejecutar_bot_una_vez():
     chrome_options = Options()
-    chrome_options.add_argument("--headless")  # Modo headless (sin ventana)
-    chrome_options.add_argument("--no-sandbox")  # Necesario en Linux cloud
-    chrome_options.add_argument("--disable-dev-shm-usage")  # Para evitar problemas memoria
-    chrome_options.add_argument("--disable-gpu")  # Opcional para headless en algunos sistemas
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
 
     driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
@@ -165,33 +165,32 @@ def ejecutar_bot():
         with open("seguidos.txt", "r", encoding="utf-8") as f:
             for linea in f:
                 lista_seguidos.add(linea.strip())
-        logger.info(f"Cargados {len(lista_seguidos)} usuarios ya seguidos desde archivo.")
 
     try:
-        while True:
-            candidatos = buscar_perfiles(driver, cantidad=60)
-            random.shuffle(candidatos)
+        candidatos = buscar_perfiles(driver, cantidad=20)  # Menos para respuesta rápida
+        random.shuffle(candidatos)
 
-            for user in candidatos:
-                if user in lista_seguidos:
-                    continue
-                if analizar_perfil(driver, user):
-                    if seguir_usuario(driver, user):
-                        with open("seguidos.txt", "a", encoding="utf-8") as f:
-                            f.write(user + "\n")
-                        logger.info(f"Guardado {user} en seguidos.txt")
-                    else:
-                        logger.info(f"No se pudo seguir a {user}")
+        seguidos_esta_vez = 0
 
-                time.sleep(random.uniform(3, 6))
+        for user in candidatos:
+            if user in lista_seguidos:
+                continue
+            if analizar_perfil(driver, user):
+                if seguir_usuario(driver, user):
+                    with open("seguidos.txt", "a", encoding="utf-8") as f:
+                        f.write(user + "\n")
+                    lista_seguidos.add(user)
+                    seguidos_esta_vez += 1
+                if seguidos_esta_vez >= 3:  # Limitar para no usar tokens rápido
+                    break
+            time.sleep(random.uniform(3, 6))
 
-            logger.info("🔁 Volviendo a buscar más perfiles en 'Para ti'...\n")
-            time.sleep(random.uniform(10, 20))
+        return True, f"Se siguieron {seguidos_esta_vez} usuarios."
 
-    except KeyboardInterrupt:
-        logger.info("🛑 Script detenido manualmente por el usuario.")
     except Exception as e:
-        logger.error(f"Error en ejecución principal: {e}")
+        logger.error(f"Error en ejecución bot una vez: {e}")
+        return False, str(e)
+
     finally:
         driver.quit()
         logger.info("Driver cerrado y script finalizado.")
