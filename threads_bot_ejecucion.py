@@ -153,21 +153,16 @@ def buscar_perfiles(driver, cantidad=100):
 
 def ejecutar_bot_una_vez():
     chrome_options = Options()
-    
-    # Ruta corregida para Render.com, usar chromium-browser, no google-chrome
-    chrome_options.binary_location = "/usr/bin/chromium-browser"
-    from webdriver_manager.chrome import ChromeDriverManager
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    
-    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
-    
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.binary_location = "/usr/bin/chromium"
 
-    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
+    driver = webdriver.Chrome(
+        service=ChromeService("/usr/bin/chromedriver"),
+        options=chrome_options
+    )
 
     if os.path.exists("seguidos.txt"):
         with open("seguidos.txt", "r", encoding="utf-8") as f:
