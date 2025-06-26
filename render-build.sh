@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
-# Instala Chromium en entorno Render
-apt-get update
-apt-get install -y chromium chromium-driver
+#!/bin/bash
+echo "🛠 Ejecutando build script..."
+python3 install_chrome.py
+pip install -r requirements.txt
