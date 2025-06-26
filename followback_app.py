@@ -7,9 +7,8 @@ import threading
 import time
 import random
 from flask import Flask, render_template, request, redirect, url_for, flash, session
-import chromedriver_autoinstaller
-chromedriver_autoinstaller.install()  # Instala el ChromeDriver compatible con la versión de Chromium
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -45,7 +44,6 @@ def cargar_cookies(driver, username):
             print(f"✅ Cookies encontradas: {len(cookies)} entradas")
 
             for cookie in cookies:
-                # Filtramos solo los campos que necesita Selenium
                 cookie_clean = {
                     "name": cookie.get("name"),
                     "value": cookie.get("value"),
@@ -67,7 +65,12 @@ def cargar_cookies(driver, username):
 # --- FUNCIONES DEL BOT ---
 def ejecutar_bot(username, log_fn=print):
     log_fn(f"🟢 Iniciando ejecución del bot para: {username}")
+
+    CHROME_BIN = os.path.join(os.getcwd(), "bin", "chrome")
+    CHROMEDRIVER_BIN = os.path.join(os.getcwd(), "bin", "chromedriver")
+
     chrome_options = Options()
+    chrome_options.binary_location = CHROME_BIN
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
@@ -75,7 +78,7 @@ def ejecutar_bot(username, log_fn=print):
     chrome_options.add_argument("--window-size=1920,1080")
 
     try:
-        driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=chrome_options)
+        driver = webdriver.Chrome(service=ChromeService(CHROMEDRIVER_BIN), options=chrome_options)
         driver.get("https://www.threads.net")
         log_fn("✅ Chrome iniciado y Threads abierto")
 
@@ -118,7 +121,6 @@ def ejecutar_bot(username, log_fn=print):
     except Exception as e:
         log_fn(f"⛔ Error durante la ejecución del bot: {e}")
         return False, "Error durante la ejecución. Mira la consola."
-
 
 def buscar_perfiles_en_para_ti(driver, cantidad_a_extraer=300, log_fn=print):
     log_fn("🌐 Navegando por la sección 'Para ti'")
