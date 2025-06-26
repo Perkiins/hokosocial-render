@@ -7,13 +7,13 @@ import threading
 import time
 import random
 from flask import Flask, render_template, request, redirect, url_for, flash, session
+import chromedriver_autoinstaller
+chromedriver_autoinstaller.install()  # Instala el ChromeDriver compatible con la versión de Chromium
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException
 
 # --- CONFIGURACIÓN FLASK ---
@@ -68,7 +68,6 @@ def cargar_cookies(driver, username):
 def ejecutar_bot(username, log_fn=print):
     log_fn(f"🟢 Iniciando ejecución del bot para: {username}")
     chrome_options = Options()
-    chrome_options.binary_location = "/usr/bin/chromium"
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
