@@ -1,4 +1,4 @@
-flask
+gunicorn
+Flask
 selenium
 webdriver-manager
-gunicorn
