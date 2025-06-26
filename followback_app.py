@@ -68,6 +68,7 @@ def cargar_cookies(driver, username):
 def ejecutar_bot(username, log_fn=print):
     log_fn(f"🟢 Iniciando ejecución del bot para: {username}")
     chrome_options = Options()
+    chrome_options.binary_location = "/usr/bin/chromium"
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
