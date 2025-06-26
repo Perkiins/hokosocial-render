@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: followbot
+    env: python
+    buildCommand: ""
+    startCommand: gunicorn followback_app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11

@@ -1,0 +1,1 @@
+web: gunicorn followback_app:app
