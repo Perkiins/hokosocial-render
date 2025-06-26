@@ -1,4 +1,4 @@
-# followback_app.py - Flask App con Cookies y SQLite
+# followback_app.py - Flask App con Cookies y SQLite en Render
 
 import os
 import json
@@ -38,11 +38,8 @@ def guardar_cookies(driver, username):
 def cargar_cookies(driver, username):
     try:
         path = f"cookies_{username}.json"
-        print(f"📂 Buscando archivo de cookies: {path}")
         with open(path, "r", encoding='utf-8') as f:
             cookies = json.load(f)
-            print(f"✅ Cookies encontradas: {len(cookies)} entradas")
-
             for cookie in cookies:
                 cookie_clean = {
                     "name": cookie.get("name"),
@@ -54,9 +51,7 @@ def cargar_cookies(driver, username):
                 }
                 if "expirationDate" in cookie:
                     cookie_clean["expiry"] = int(cookie["expirationDate"])
-
                 driver.add_cookie(cookie_clean)
-
         return True
     except Exception as e:
         print(f"⛔ Error cargando cookies desde {path}: {e}")
@@ -66,8 +61,8 @@ def cargar_cookies(driver, username):
 def ejecutar_bot(username, log_fn=print):
     log_fn(f"🟢 Iniciando ejecución del bot para: {username}")
 
-    CHROME_BIN = os.path.join(os.getcwd(), "bin", "chrome")
-    CHROMEDRIVER_BIN = os.path.join(os.getcwd(), "bin", "chromedriver")
+    CHROME_BIN = "/opt/render/project/src/bin/chrome"
+    CHROMEDRIVER_BIN = "/opt/render/project/src/bin/chromedriver"
 
     chrome_options = Options()
     chrome_options.binary_location = CHROME_BIN
@@ -99,7 +94,6 @@ def ejecutar_bot(username, log_fn=print):
                 seguidos = set(line.strip() for line in f)
 
         nuevos_seguidos = 0
-
         log_fn("🔍 Buscando posibles perfiles...")
         perfiles = buscar_perfiles_en_para_ti(driver, 50, log_fn)
         log_fn(f"✅ Encontrados {len(perfiles)} perfiles")
