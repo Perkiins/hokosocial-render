@@ -75,6 +75,10 @@ def ejecutar_bot(username, log_fn=print):
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+    chrome_options.add_argument("--single-process")
     chrome_options.add_argument("--window-size=1920,1080")
 
     try:
