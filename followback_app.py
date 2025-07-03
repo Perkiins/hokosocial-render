@@ -22,12 +22,14 @@ def crear_tabla():
                         username TEXT UNIQUE,
                         password TEXT
                     )''')
-        # Añadir la columna 'tokens' si no existe
-        try:
-            c.execute("ALTER TABLE usuarios ADD COLUMN tokens INTEGER DEFAULT 10")
-        except sqlite3.OperationalError:
-            pass  # Ya existe
+        # Añadir columnas si no existen
+        try: c.execute("ALTER TABLE usuarios ADD COLUMN tokens INTEGER DEFAULT 10")
+        except: pass
+        try: c.execute("ALTER TABLE usuarios ADD COLUMN rol TEXT DEFAULT 'user'")
+        except: pass
         conn.commit()
+
+crear_tabla()
 
 # Registro
 @app.route('/api/register', methods=['POST'])
@@ -36,18 +38,19 @@ def register():
         data = request.json
         username = data.get('username')
         password = data.get('password')
+        rol = 'admin' if username == 'admin' else 'user'
 
         if not username or not password:
             return jsonify({"message": "Faltan datos"}), 400
 
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            try:
-                c.execute("INSERT INTO usuarios (username, password, tokens) VALUES (?, ?, ?)", (username, password, 10))
-                conn.commit()
-                return jsonify({"message": "Usuario registrado correctamente"}), 201
-            except sqlite3.IntegrityError:
-                return jsonify({"message": "El usuario ya existe"}), 409
+            c.execute("INSERT INTO usuarios (username, password, tokens, rol) VALUES (?, ?, ?, ?)",
+                      (username, password, 10, rol))
+            conn.commit()
+            return jsonify({"message": "Usuario registrado correctamente"}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({"message": "El usuario ya existe"}), 409
     except Exception as e:
         print("⚠️ Error en /api/register:", e)
         return jsonify({"error": str(e)}), 500
@@ -61,23 +64,23 @@ def login():
 
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("SELECT * FROM usuarios WHERE username=? AND password=?", (username, password))
+        c.execute("SELECT username, rol FROM usuarios WHERE username=? AND password=?", (username, password))
         user = c.fetchone()
 
     if user:
         token = jwt.encode({
-            'username': username,
+            'username': user[0],
+            'rol': user[1],
             'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=12)
         }, app.config['SECRET_KEY'], algorithm='HS256')
 
-        resp = make_response(jsonify({'message': 'Login exitoso'}))
-        # Cookie con JWT (necesaria para credentials: 'include')
+        resp = make_response(jsonify({'message': 'Login exitoso', 'token': token}))
         resp.set_cookie('token', token, httponly=True, samesite='None', secure=True)
         return resp
     else:
         return jsonify({'message': 'Credenciales incorrectas'}), 401
 
-# Ruta protegida (devuelve datos del usuario)
+# Ruta protegida: datos del usuario
 @app.route('/api/user-data', methods=['GET'])
 def user_data():
     token = request.headers.get('Authorization')
@@ -87,6 +90,7 @@ def user_data():
     try:
         decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
         username = decoded['username']
+        rol = decoded['rol']
 
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -95,6 +99,7 @@ def user_data():
 
         return jsonify({
             'username': username,
+            'rol': rol,
             'tokens': result[0] if result else 0
         }), 200
     except jwt.ExpiredSignatureError:
@@ -102,6 +107,7 @@ def user_data():
     except jwt.InvalidTokenError:
         return jsonify({'message': 'Token inválido'}), 401
 
+# Ejecutar bot (consume token)
 @app.route('/api/run-bot', methods=['POST'])
 def run_bot():
     token = request.headers.get('Authorization')
@@ -127,7 +133,50 @@ def run_bot():
     except jwt.InvalidTokenError:
         return jsonify({'message': 'Token inválido'}), 401
 
-# Logout: borra cookie
+# Ver todos los usuarios (admin only)
+@app.route('/api/usuarios', methods=['GET'])
+def get_usuarios():
+    token = request.headers.get('Authorization')
+    if not token:
+        return jsonify({'message': 'Token requerido'}), 401
+
+    try:
+        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        if decoded.get('rol') != 'admin':
+            return jsonify({'message': 'No autorizado'}), 403
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, username, rol, tokens FROM usuarios")
+            users = [{'id': row[0], 'username': row[1], 'rol': row[2], 'tokens': row[3]} for row in c.fetchall()]
+            return jsonify({'usuarios': users})
+    except jwt.InvalidTokenError:
+        return jsonify({'message': 'Token inválido'}), 401
+
+# Eliminar usuario (admin only)
+@app.route('/api/eliminar-usuario', methods=['POST'])
+def eliminar_usuario():
+    token = request.headers.get('Authorization')
+    if not token:
+        return jsonify({'message': 'Token requerido'}), 401
+
+    try:
+        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        if decoded.get('rol') != 'admin':
+            return jsonify({'message': 'No autorizado'}), 403
+
+        data = request.json
+        user_id = data.get('id')
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM usuarios WHERE id=?", (user_id,))
+            conn.commit()
+        return jsonify({'message': 'Usuario eliminado correctamente'})
+    except Exception as e:
+        return jsonify({'message': f'Error: {e}'}), 500
+
+# Logout
 @app.route('/api/logout', methods=['GET'])
 def logout():
     resp = make_response(jsonify({'message': 'Sesión cerrada'}))
