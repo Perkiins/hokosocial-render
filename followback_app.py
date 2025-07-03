@@ -69,16 +69,22 @@ def login():
 # Ruta protegida (devuelve datos del usuario)
 @app.route('/api/user-data', methods=['GET'])
 def user_data():
-    token = request.cookies.get('token')
-
+    token = request.headers.get('Authorization')
     if not token:
         return jsonify({'message': 'Token requerido'}), 401
 
     try:
         decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        username = decoded['username']
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT tokens FROM usuarios WHERE username=?", (username,))
+            result = c.fetchone()
+
         return jsonify({
-            'username': decoded['username'],
-            'tokens': 10  # Simulación de tokens
+            'username': username,
+            'tokens': result[0] if result else 0
         }), 200
     except jwt.ExpiredSignatureError:
         return jsonify({'message': 'Token expirado'}), 401
