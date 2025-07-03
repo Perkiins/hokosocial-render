@@ -22,11 +22,13 @@ def crear_tabla():
                         username TEXT UNIQUE,
                         password TEXT
                     )''')
+        # Añadir la columna 'tokens' si no existe
+        try:
+            c.execute("ALTER TABLE usuarios ADD COLUMN tokens INTEGER DEFAULT 10")
+        except sqlite3.OperationalError:
+            pass  # Ya existe
         conn.commit()
 
-crear_tabla()
-
-# Registro
 # Registro
 @app.route('/api/register', methods=['POST'])
 def register():
