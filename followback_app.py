@@ -7,7 +7,7 @@ import datetime
 # Configuración
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'clave-secreta-segura'  # Cámbiala por algo real
-CORS(app, origins=["https://hokosocial.vercel.app"])  # 💥 Mueve esto después de crear la app
+CORS(app, resources={r"/api/*": {"origins": "https://hokosocial.vercel.app"}}, supports_credentials=True)
 
 DB_PATH = 'usuarios.db'
 
