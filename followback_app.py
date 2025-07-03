@@ -7,10 +7,10 @@ import os
 
 # Configuración
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'clave-secreta-segura'  # Cámbiala en producción
+app.config['SECRET_KEY'] = 'clave-secreta-segura'
 DB_PATH = os.path.join('/tmp', 'usuarios.db')
 
-# CORS para permitir cookies cross-origin (Vercel <-> Render)
+# CORS
 CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
 
 # Crear tabla usuarios si no existe
@@ -22,7 +22,6 @@ def crear_tabla():
                         username TEXT UNIQUE,
                         password TEXT
                     )''')
-        # Añadir columnas si no existen
         try: c.execute("ALTER TABLE usuarios ADD COLUMN tokens INTEGER DEFAULT 10")
         except: pass
         try: c.execute("ALTER TABLE usuarios ADD COLUMN rol TEXT DEFAULT 'user'")
@@ -38,7 +37,6 @@ def register():
         data = request.json
         username = data.get('username')
         password = data.get('password')
-        rol = 'admin' if username == 'admin' else 'user'
 
         if not username or not password:
             return jsonify({"message": "Faltan datos"}), 400
@@ -46,7 +44,7 @@ def register():
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
             c.execute("INSERT INTO usuarios (username, password, tokens, rol) VALUES (?, ?, ?, ?)",
-                      (username, password, 10, rol))
+                      (username, password, 10, 'user'))
             conn.commit()
             return jsonify({"message": "Usuario registrado correctamente"}), 201
     except sqlite3.IntegrityError:
@@ -64,53 +62,51 @@ def login():
 
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("SELECT username, rol FROM usuarios WHERE username=? AND password=?", (username, password))
+        c.execute("SELECT * FROM usuarios WHERE username=? AND password=?", (username, password))
         user = c.fetchone()
 
     if user:
         token = jwt.encode({
-            'username': user[0],
-            'rol': user[1],
+            'username': username,
             'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=12)
         }, app.config['SECRET_KEY'], algorithm='HS256')
 
-        resp = make_response(jsonify({'message': 'Login exitoso', 'token': token}))
+        resp = make_response(jsonify({'message': 'Login exitoso'}))
         resp.set_cookie('token', token, httponly=True, samesite='None', secure=True)
         return resp
     else:
         return jsonify({'message': 'Credenciales incorrectas'}), 401
 
-# Ruta protegida: datos del usuario
+# Ruta protegida (datos del usuario)
 @app.route('/api/user-data', methods=['GET'])
 def user_data():
-    token = request.headers.get('Authorization')
+    token = request.cookies.get('token')
     if not token:
         return jsonify({'message': 'Token requerido'}), 401
 
     try:
         decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
         username = decoded['username']
-        rol = decoded['rol']
 
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute("SELECT tokens FROM usuarios WHERE username=?", (username,))
+            c.execute("SELECT tokens, rol FROM usuarios WHERE username=?", (username,))
             result = c.fetchone()
 
         return jsonify({
             'username': username,
-            'rol': rol,
-            'tokens': result[0] if result else 0
+            'tokens': result[0] if result else 0,
+            'rol': result[1] if result else 'user'
         }), 200
     except jwt.ExpiredSignatureError:
         return jsonify({'message': 'Token expirado'}), 401
     except jwt.InvalidTokenError:
         return jsonify({'message': 'Token inválido'}), 401
 
-# Ejecutar bot (consume token)
+# Ejecutar bot
 @app.route('/api/run-bot', methods=['POST'])
 def run_bot():
-    token = request.headers.get('Authorization')
+    token = request.cookies.get('token')
     if not token:
         return jsonify({'message': 'Token requerido'}), 401
 
@@ -133,49 +129,6 @@ def run_bot():
     except jwt.InvalidTokenError:
         return jsonify({'message': 'Token inválido'}), 401
 
-# Ver todos los usuarios (admin only)
-@app.route('/api/usuarios', methods=['GET'])
-def get_usuarios():
-    token = request.headers.get('Authorization')
-    if not token:
-        return jsonify({'message': 'Token requerido'}), 401
-
-    try:
-        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        if decoded.get('rol') != 'admin':
-            return jsonify({'message': 'No autorizado'}), 403
-
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT id, username, rol, tokens FROM usuarios")
-            users = [{'id': row[0], 'username': row[1], 'rol': row[2], 'tokens': row[3]} for row in c.fetchall()]
-            return jsonify({'usuarios': users})
-    except jwt.InvalidTokenError:
-        return jsonify({'message': 'Token inválido'}), 401
-
-# Eliminar usuario (admin only)
-@app.route('/api/eliminar-usuario', methods=['POST'])
-def eliminar_usuario():
-    token = request.headers.get('Authorization')
-    if not token:
-        return jsonify({'message': 'Token requerido'}), 401
-
-    try:
-        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        if decoded.get('rol') != 'admin':
-            return jsonify({'message': 'No autorizado'}), 403
-
-        data = request.json
-        user_id = data.get('id')
-
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM usuarios WHERE id=?", (user_id,))
-            conn.commit()
-        return jsonify({'message': 'Usuario eliminado correctamente'})
-    except Exception as e:
-        return jsonify({'message': f'Error: {e}'}), 500
-
 # Logout
 @app.route('/api/logout', methods=['GET'])
 def logout():
@@ -183,7 +136,65 @@ def logout():
     resp.set_cookie('token', '', expires=0)
     return resp
 
-# Simulación de log del bot
+# Ver todos los usuarios (solo admin)
+@app.route('/api/users', methods=['GET'])
+def get_users():
+    token = request.cookies.get('token')
+    if not token:
+        return jsonify({'message': 'Token requerido'}), 401
+
+    try:
+        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        username = decoded['username']
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT rol FROM usuarios WHERE username=?", (username,))
+            rol = c.fetchone()[0]
+
+            if rol != 'admin':
+                return jsonify({'message': 'No autorizado'}), 403
+
+            c.execute("SELECT id, username, tokens, rol FROM usuarios")
+            users = c.fetchall()
+            users_list = [{'id': u[0], 'username': u[1], 'tokens': u[2], 'rol': u[3]} for u in users]
+            return jsonify(users_list)
+    except Exception as e:
+        print("⚠️ Error en /api/users:", e)
+        return jsonify({'error': str(e)}), 500
+
+# Eliminar usuario (solo admin)
+@app.route('/api/delete-user', methods=['POST'])
+def delete_user():
+    token = request.cookies.get('token')
+    if not token:
+        return jsonify({'message': 'Token requerido'}), 401
+
+    try:
+        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        username_admin = decoded['username']
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT rol FROM usuarios WHERE username=?", (username_admin,))
+            rol = c.fetchone()[0]
+
+            if rol != 'admin':
+                return jsonify({'message': 'No autorizado'}), 403
+
+            data = request.json
+            user_id = data.get('id')
+            if not user_id:
+                return jsonify({'message': 'ID requerido'}), 400
+
+            c.execute("DELETE FROM usuarios WHERE id=?", (user_id,))
+            conn.commit()
+            return jsonify({'message': 'Usuario eliminado'}), 200
+    except Exception as e:
+        print("⚠️ Error en /api/delete-user:", e)
+        return jsonify({'error': str(e)}), 500
+
+# Log simulado
 @app.route('/api/log', methods=['GET'])
 def get_log():
     return jsonify({
@@ -191,12 +202,12 @@ def get_log():
         'mensaje_bot': 'Esperando acción del usuario...'
     })
 
-# Test de vida
+# Test
 @app.route('/')
 def home():
     return 'API funcionando correctamente 🔥 - MAAX 𒉭'
 
-# Headers extra CORS
+# Headers CORS
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
