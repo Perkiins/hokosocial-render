@@ -35,7 +35,7 @@ def register():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         try:
-            c.execute("INSERT INTO usuarios (username, password) VALUES (?, ?)", (username, password))
+            c.execute("INSERT INTO usuarios (username, password, tokens) VALUES (?, ?, ?)", (username, password, 10))
             conn.commit()
             return jsonify({"message": "Usuario registrado correctamente"}), 201
         except sqlite3.IntegrityError:
