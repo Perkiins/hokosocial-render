@@ -1,18 +1,18 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS  # 💥 Importación que faltaba
-from flask import request, jsonify
+from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
 import sqlite3
 import jwt
 import datetime
 
 # Configuración
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'clave-secreta-segura'  # Cámbiala por algo real
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
-
+app.config['SECRET_KEY'] = 'clave-secreta-segura'  # Cámbiala en producción
 DB_PATH = 'usuarios.db'
 
-# Crear tabla si no existe
+# CORS para permitir cookies cross-origin (Vercel <-> Render)
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
+
+# Crear tabla usuarios si no existe
 def crear_tabla():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -25,7 +25,7 @@ def crear_tabla():
 
 crear_tabla()
 
-# Ruta de registro
+# Registro
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
@@ -41,7 +41,7 @@ def register():
         except sqlite3.IntegrityError:
             return jsonify({"message": "El usuario ya existe"}), 409
 
-# Ruta de login
+# Login
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
@@ -59,14 +59,17 @@ def login():
             'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=12)
         }, app.config['SECRET_KEY'], algorithm='HS256')
 
-        return jsonify({'token': token}), 200
+        resp = make_response(jsonify({'message': 'Login exitoso'}))
+        # Cookie con JWT (necesaria para credentials: 'include')
+        resp.set_cookie('token', token, httponly=True, samesite='None', secure=True)
+        return resp
     else:
         return jsonify({'message': 'Credenciales incorrectas'}), 401
 
-# Ruta protegida (requiere token)
+# Ruta protegida (devuelve datos del usuario)
 @app.route('/api/user-data', methods=['GET'])
 def user_data():
-    token = request.cookies.get('token')  # ← cambia esto
+    token = request.cookies.get('token')
 
     if not token:
         return jsonify({'message': 'Token requerido'}), 401
@@ -75,13 +78,21 @@ def user_data():
         decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
         return jsonify({
             'username': decoded['username'],
-            'tokens': 10  # Puedes simular esto por ahora
+            'tokens': 10  # Simulación de tokens
         }), 200
     except jwt.ExpiredSignatureError:
         return jsonify({'message': 'Token expirado'}), 401
     except jwt.InvalidTokenError:
         return jsonify({'message': 'Token inválido'}), 401
 
+# Logout: borra cookie
+@app.route('/api/logout', methods=['GET'])
+def logout():
+    resp = make_response(jsonify({'message': 'Sesión cerrada'}))
+    resp.set_cookie('token', '', expires=0)
+    return resp
+
+# Simulación de log del bot
 @app.route('/api/log', methods=['GET'])
 def get_log():
     return jsonify({
@@ -89,16 +100,18 @@ def get_log():
         'mensaje_bot': 'Esperando acción del usuario...'
     })
 
+# Test de vida
+@app.route('/')
+def home():
+    return 'API funcionando correctamente 🔥 - MAAX 𒉭'
+
+# Headers extra CORS
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
-# Test de vida
-@app.route('/')
-def home():
-    return 'API funcionando correctamente 🔥 - MAAX 𒉭'
-
+# Ejecutar
 if __name__ == '__main__':
     app.run(debug=True)
