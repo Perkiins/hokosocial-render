@@ -77,6 +77,13 @@ def user_data():
     except jwt.InvalidTokenError:
         return jsonify({'message': 'Token inválido'}), 401
 
+@app.route('/api/log', methods=['GET'])
+def get_log():
+    return jsonify({
+        'log_lines': ['[00:00] Bot aún no ejecutado.'],
+        'mensaje_bot': 'Esperando acción del usuario...'
+    })
+
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
