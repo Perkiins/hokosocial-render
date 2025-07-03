@@ -80,7 +80,7 @@ def login():
 # Ruta protegida (datos del usuario)
 @app.route('/api/user-data', methods=['GET'])
 def user_data():
-    token = request.cookies.get('token')
+    token = request.headers.get('Authorization')
     if not token:
         return jsonify({'message': 'Token requerido'}), 401
 
