@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-CORS(app, origins=["https://hokosocial.vercel.app"])
+from flask_cors import CORS  # 💥 Importación que faltaba
 import sqlite3
 import jwt
 import datetime
@@ -7,7 +7,7 @@ import datetime
 # Configuración
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'clave-secreta-segura'  # Cámbiala por algo real
-CORS(app)
+CORS(app, origins=["https://hokosocial.vercel.app"])  # 💥 Mueve esto después de crear la app
 
 DB_PATH = 'usuarios.db'
 
