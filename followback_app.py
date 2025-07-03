@@ -8,7 +8,7 @@ import os
 # Configuración
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'clave-secreta-segura'
-DB_PATH = os.path.join('/tmp', 'usuarios.db')
+DB_PATH = os.path.join(os.getcwd(), 'usuarios.db')
 
 # CORS
 CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
