@@ -7,7 +7,7 @@ import datetime
 # Configuración
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'clave-secreta-segura'  # Cámbiala por algo real
-CORS(app, resources={r"/api/*": {"origins": "https://hokosocial.vercel.app"}}, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 DB_PATH = 'usuarios.db'
 
@@ -77,10 +77,16 @@ def user_data():
     except jwt.InvalidTokenError:
         return jsonify({'message': 'Token inválido'}), 401
 
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
 # Test de vida
 @app.route('/')
 def home():
-    return 'API funcionando correctamente 🔥'
+    return 'API funcionando correctamente 🔥 - MAAX 𒉭'
 
 if __name__ == '__main__':
     app.run(debug=True)
