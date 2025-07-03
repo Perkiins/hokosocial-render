@@ -194,6 +194,40 @@ def delete_user():
         print("⚠️ Error en /api/delete-user:", e)
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/update-user', methods=['POST'])
+def update_user():
+    token = request.cookies.get('token')
+    if not token:
+        return jsonify({'message': 'Token requerido'}), 401
+
+    try:
+        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        username_admin = decoded['username']
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT rol FROM usuarios WHERE username=?", (username_admin,))
+            rol = c.fetchone()[0]
+
+            if rol != 'admin':
+                return jsonify({'message': 'No autorizado'}), 403
+
+            data = request.json
+            user_id = data.get('id')
+            nuevo_rol = data.get('rol')
+            nuevos_tokens = data.get('tokens')
+
+            if user_id is None:
+                return jsonify({'message': 'Faltan datos'}), 400
+
+            c.execute("UPDATE usuarios SET rol=?, tokens=? WHERE id=?", (nuevo_rol, nuevos_tokens, user_id))
+            conn.commit()
+            return jsonify({'message': 'Usuario actualizado'}), 200
+
+    except Exception as e:
+        print("⚠️ Error en /api/update-user:", e)
+        return jsonify({'error': str(e)}), 500
+
 # Log simulado
 @app.route('/api/log', methods=['GET'])
 def get_log():
