@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: hokosocial-api
-    env: python
-    buildCommand: ""
-    startCommand: gunicorn followback_app:app
-    plan: free
-    region: frankfurt
