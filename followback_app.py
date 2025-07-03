@@ -91,6 +91,31 @@ def user_data():
     except jwt.InvalidTokenError:
         return jsonify({'message': 'Token inválido'}), 401
 
+@app.route('/api/run-bot', methods=['POST'])
+def run_bot():
+    token = request.headers.get('Authorization')
+    if not token:
+        return jsonify({'message': 'Token requerido'}), 401
+
+    try:
+        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        username = decoded['username']
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT tokens FROM usuarios WHERE username=?", (username,))
+            tokens_actuales = c.fetchone()[0]
+
+            if tokens_actuales > 0:
+                nuevos_tokens = tokens_actuales - 1
+                c.execute("UPDATE usuarios SET tokens=? WHERE username=?", (nuevos_tokens, username))
+                conn.commit()
+                return jsonify({'message': 'Bot ejecutado', 'tokens_restantes': nuevos_tokens}), 200
+            else:
+                return jsonify({'message': 'No tienes tokens'}), 400
+    except jwt.InvalidTokenError:
+        return jsonify({'message': 'Token inválido'}), 401
+
 # Logout: borra cookie
 @app.route('/api/logout', methods=['GET'])
 def logout():
