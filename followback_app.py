@@ -3,11 +3,12 @@ from flask_cors import CORS
 import sqlite3
 import jwt
 import datetime
+import os
 
 # Configuración
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'clave-secreta-segura'  # Cámbiala en producción
-DB_PATH = 'usuarios.db'
+DB_PATH = os.path.join('/tmp', 'usuarios.db')
 
 # CORS para permitir cookies cross-origin (Vercel <-> Render)
 CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
@@ -26,20 +27,28 @@ def crear_tabla():
 crear_tabla()
 
 # Registro
+# Registro
 @app.route('/api/register', methods=['POST'])
 def register():
-    data = request.json
-    username = data.get('username')
-    password = data.get('password')
+    try:
+        data = request.json
+        username = data.get('username')
+        password = data.get('password')
 
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        try:
-            c.execute("INSERT INTO usuarios (username, password, tokens) VALUES (?, ?, ?)", (username, password, 10))
-            conn.commit()
-            return jsonify({"message": "Usuario registrado correctamente"}), 201
-        except sqlite3.IntegrityError:
-            return jsonify({"message": "El usuario ya existe"}), 409
+        if not username or not password:
+            return jsonify({"message": "Faltan datos"}), 400
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            try:
+                c.execute("INSERT INTO usuarios (username, password, tokens) VALUES (?, ?, ?)", (username, password, 10))
+                conn.commit()
+                return jsonify({"message": "Usuario registrado correctamente"}), 201
+            except sqlite3.IntegrityError:
+                return jsonify({"message": "El usuario ya existe"}), 409
+    except Exception as e:
+        print("⚠️ Error en /api/register:", e)
+        return jsonify({"error": str(e)}), 500
 
 # Login
 @app.route('/api/login', methods=['POST'])
