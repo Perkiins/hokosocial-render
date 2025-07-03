@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
+CORS(app, origins=["https://hokosocial.vercel.app"])
 import sqlite3
 import jwt
 import datetime
