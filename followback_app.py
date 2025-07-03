@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS  # 💥 Importación que faltaba
+from flask import request, jsonify
 import sqlite3
 import jwt
 import datetime
@@ -65,13 +66,17 @@ def login():
 # Ruta protegida (requiere token)
 @app.route('/api/user-data', methods=['GET'])
 def user_data():
-    token = request.headers.get('Authorization')
+    token = request.cookies.get('token')  # ← cambia esto
+
     if not token:
         return jsonify({'message': 'Token requerido'}), 401
 
     try:
         decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        return jsonify({'message': f'Datos del usuario {decoded["username"]}'}), 200
+        return jsonify({
+            'username': decoded['username'],
+            'tokens': 10  # Puedes simular esto por ahora
+        }), 200
     except jwt.ExpiredSignatureError:
         return jsonify({'message': 'Token expirado'}), 401
     except jwt.InvalidTokenError:
