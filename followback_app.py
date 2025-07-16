@@ -1,59 +1,62 @@
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
 import jwt
 import datetime
 import os
+import threading
 
 # Configuración
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'clave-secreta-segura'
-DB_PATH = os.path.join(os.getcwd(), 'usuarios.db')
+app.config['SECRET_KEY'] = 'clave-super-secreta'
+CORS(app, origins=["https://hokosocial.vercel.app"], supports_credentials=True)
 
-# CORS
-CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
+DB_PATH = 'usuarios.db'
 
-# Crear tabla usuarios si no existe
+# Crear tabla si no existe
 def crear_tabla():
     with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS usuarios (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT UNIQUE,
-                        password TEXT
-                    )''')
-        try: c.execute("ALTER TABLE usuarios ADD COLUMN tokens INTEGER DEFAULT 10")
-        except: pass
-        try: c.execute("ALTER TABLE usuarios ADD COLUMN rol TEXT DEFAULT 'user'")
-        except: pass
-        conn.commit()
+        conn.execute('''CREATE TABLE IF NOT EXISTS usuarios (
+            username TEXT PRIMARY KEY,
+            password TEXT,
+            tokens INTEGER DEFAULT 5,
+            rol TEXT DEFAULT 'user'
+        )''')
 
 crear_tabla()
 
-# Registro
+# --- JWT ---
+def generar_token(username):
+    payload = {
+        'username': username,
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=12)
+    }
+    return jwt.encode(payload, app.config['SECRET_KEY'], algorithm="HS256")
+
+def verificar_token(token):
+    try:
+        return jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+    except:
+        return None
+
+# --- Registro ---
 @app.route('/api/register', methods=['POST'])
 def register():
-    try:
-        data = request.json
-        username = data.get('username')
-        password = data.get('password')
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
 
-        if not username or not password:
-            return jsonify({"message": "Faltan datos"}), 400
-
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("INSERT INTO usuarios (username, password, tokens, rol) VALUES (?, ?, ?, ?)",
-                      (username, password, 10, 'user'))
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("INSERT INTO usuarios (username, password) VALUES (?, ?)", (username, password))
             conn.commit()
-            return jsonify({"message": "Usuario registrado correctamente"}), 201
-    except sqlite3.IntegrityError:
-        return jsonify({"message": "El usuario ya existe"}), 409
-    except Exception as e:
-        print("⚠️ Error en /api/register:", e)
-        return jsonify({"error": str(e)}), 500
+            token = generar_token(username)
+            return jsonify({"token": token}), 201
+        except sqlite3.IntegrityError:
+            return jsonify({"message": "Usuario ya existe"}), 409
 
-# Login
+# --- Login ---
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
@@ -61,193 +64,78 @@ def login():
     password = data.get('password')
 
     with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("SELECT * FROM usuarios WHERE username=? AND password=?", (username, password))
-        user = c.fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM usuarios WHERE username = ? AND password = ?", (username, password))
+        if cur.fetchone():
+            token = generar_token(username)
+            return jsonify({"token": token})
+    return jsonify({"message": "Credenciales incorrectas"}), 401
 
-    if user:
-        token = jwt.encode({
-            'username': username,
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=12)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
-
-        resp = make_response(jsonify({'message': 'Login exitoso'}))
-        resp.set_cookie('token', token, httponly=True, samesite='None', secure=True)
-        return resp
-    else:
-        return jsonify({'message': 'Credenciales incorrectas'}), 401
-
-# Ruta protegida (datos del usuario)
+# --- User Data (protegido) ---
 @app.route('/api/user-data', methods=['GET'])
 def user_data():
-    token = request.headers.get('Authorization')
-    if not token:
-        return jsonify({'message': 'Token requerido'}), 401
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    user = verificar_token(token)
+    if not user:
+        return jsonify({"message": "Token inválido"}), 401
 
-    try:
-        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        username = decoded['username']
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT tokens, rol FROM usuarios WHERE username = ?", (user["username"],))
+        row = cur.fetchone()
+        return jsonify({"username": user["username"], "tokens": row[0], "rol": row[1]})
 
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT tokens, rol FROM usuarios WHERE username=?", (username,))
-            result = c.fetchone()
-
-        return jsonify({
-            'username': username,
-            'tokens': result[0] if result else 0,
-            'rol': result[1] if result else 'user'
-        }), 200
-    except jwt.ExpiredSignatureError:
-        return jsonify({'message': 'Token expirado'}), 401
-    except jwt.InvalidTokenError:
-        return jsonify({'message': 'Token inválido'}), 401
-
-# Ejecutar bot
+# --- Ejecutar bot (simulado) ---
 @app.route('/api/run-bot', methods=['POST'])
 def run_bot():
-    token = request.cookies.get('token')
-    if not token:
-        return jsonify({'message': 'Token requerido'}), 401
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    user = verificar_token(token)
+    if not user:
+        return jsonify({"message": "Token inválido"}), 401
 
-    try:
-        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        username = decoded['username']
+    username = user["username"]
+    log_file = f"log_{username}.txt"
 
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT tokens FROM usuarios WHERE username=?", (username,))
-            tokens_actuales = c.fetchone()[0]
-
-            if tokens_actuales > 0:
-                nuevos_tokens = tokens_actuales - 1
-                c.execute("UPDATE usuarios SET tokens=? WHERE username=?", (nuevos_tokens, username))
-                conn.commit()
-                return jsonify({'message': 'Bot ejecutado', 'tokens_restantes': nuevos_tokens}), 200
-            else:
-                return jsonify({'message': 'No tienes tokens'}), 400
-    except jwt.InvalidTokenError:
-        return jsonify({'message': 'Token inválido'}), 401
-
-# Logout
-@app.route('/api/logout', methods=['GET'])
-def logout():
-    resp = make_response(jsonify({'message': 'Sesión cerrada'}))
-    resp.set_cookie('token', '', expires=0)
-    return resp
-
-# Ver todos los usuarios (solo admin)
-@app.route('/api/users', methods=['GET'])
-def get_users():
-    token = request.cookies.get('token')
-    if not token:
-        return jsonify({'message': 'Token requerido'}), 401
-
-    try:
-        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        username = decoded['username']
+    def tarea():
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("🔄 Ejecutando bot...\n")
+            import time
+            for i in range(3):
+                f.write(f"⏳ Proceso {i+1}/3\n")
+                time.sleep(1)
+            f.write("✅ Bot finalizado\n")
 
         with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT rol FROM usuarios WHERE username=?", (username,))
-            rol = c.fetchone()[0]
-
-            if rol != 'admin':
-                return jsonify({'message': 'No autorizado'}), 403
-
-            c.execute("SELECT id, username, tokens, rol FROM usuarios")
-            users = c.fetchall()
-            users_list = [{'id': u[0], 'username': u[1], 'tokens': u[2], 'rol': u[3]} for u in users]
-            return jsonify(users_list)
-    except Exception as e:
-        print("⚠️ Error en /api/users:", e)
-        return jsonify({'error': str(e)}), 500
-
-# Eliminar usuario (solo admin)
-@app.route('/api/delete-user', methods=['POST'])
-def delete_user():
-    token = request.cookies.get('token')
-    if not token:
-        return jsonify({'message': 'Token requerido'}), 401
-
-    try:
-        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        username_admin = decoded['username']
-
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT rol FROM usuarios WHERE username=?", (username_admin,))
-            rol = c.fetchone()[0]
-
-            if rol != 'admin':
-                return jsonify({'message': 'No autorizado'}), 403
-
-            data = request.json
-            user_id = data.get('id')
-            if not user_id:
-                return jsonify({'message': 'ID requerido'}), 400
-
-            c.execute("DELETE FROM usuarios WHERE id=?", (user_id,))
+            conn.execute("UPDATE usuarios SET tokens = tokens - 1 WHERE username = ? AND tokens > 0", (username,))
             conn.commit()
-            return jsonify({'message': 'Usuario eliminado'}), 200
-    except Exception as e:
-        print("⚠️ Error en /api/delete-user:", e)
-        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/update-user', methods=['POST'])
-def update_user():
-    token = request.cookies.get('token')
-    if not token:
-        return jsonify({'message': 'Token requerido'}), 401
+    threading.Thread(target=tarea).start()
+    return jsonify({"message": "Bot lanzado correctamente"})
 
-    try:
-        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-        username_admin = decoded['username']
-
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT rol FROM usuarios WHERE username=?", (username_admin,))
-            rol = c.fetchone()[0]
-
-            if rol != 'admin':
-                return jsonify({'message': 'No autorizado'}), 403
-
-            data = request.json
-            user_id = data.get('id')
-            nuevo_rol = data.get('rol')
-            nuevos_tokens = data.get('tokens')
-
-            if user_id is None:
-                return jsonify({'message': 'Faltan datos'}), 400
-
-            c.execute("UPDATE usuarios SET rol=?, tokens=? WHERE id=?", (nuevo_rol, nuevos_tokens, user_id))
-            conn.commit()
-            return jsonify({'message': 'Usuario actualizado'}), 200
-
-    except Exception as e:
-        print("⚠️ Error en /api/update-user:", e)
-        return jsonify({'error': str(e)}), 500
-
-# Log simulado
+# --- Log (protegido) ---
 @app.route('/api/log', methods=['GET'])
 def get_log():
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    user = verificar_token(token)
+    if not user:
+        return jsonify({"message": "Token inválido"}), 401
+
+    username = user["username"]
+    log_file = f"log_{username}.txt"
+    if not os.path.exists(log_file):
+        return jsonify({"log": [], "mensaje_bot": "Sin log aún."})
+
+    with open(log_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
     return jsonify({
-        'log_lines': ['[00:00] Bot aún no ejecutado.'],
-        'mensaje_bot': 'Esperando acción del usuario...'
+        "log": [l.strip() for l in lines if l.strip()],
+        "mensaje_bot": lines[-1].strip() if lines else "Sin mensaje final"
     })
 
 # Test
 @app.route('/')
 def home():
-    return 'API funcionando correctamente 🔥 - MAAX 𒉭'
+    return "🔥 HokoSocial API activa"
 
-# Headers CORS
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
-
-# Ejecutar
 if __name__ == '__main__':
     app.run(debug=True)
