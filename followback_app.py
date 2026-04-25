@@ -676,10 +676,27 @@ def create_task():
 
     # Validaciones por tipo
     if task_type == 'instagram_profile':
-        ig_user = ((payload or {}).get('username') or '').strip().lstrip('@')
-        if not ig_user or not ig_user.replace('.', '').replace('_', '').isalnum():
-            return jsonify({'message': 'username de Instagram inválido.'}), 400
-        payload = {'username': ig_user}
+        action = (payload or {}).get('action') or 'profile'
+        if action == 'profile':
+            ig_user = ((payload or {}).get('username') or '').strip().lstrip('@')
+            if not ig_user or not ig_user.replace('.', '').replace('_', '').isalnum():
+                return jsonify({'message': 'username de Instagram inválido.'}), 400
+            payload = {'action': 'profile', 'username': ig_user}
+        elif action in ('feed', 'stories', 'reels'):
+            user_id = str((payload or {}).get('user_id') or '').strip()
+            if not user_id.isdigit():
+                return jsonify({'message': f'user_id inválido para action={action}.'}), 400
+            normalized = {'action': action, 'user_id': user_id}
+            if action in ('feed', 'reels') and (payload or {}).get('max_id'):
+                normalized['max_id'] = str(payload['max_id'])
+            payload = normalized
+        elif action in ('highlights', 'tagged'):
+            ig_user = ((payload or {}).get('username') or '').strip().lstrip('@')
+            if not ig_user:
+                return jsonify({'message': 'username inválido.'}), 400
+            payload = {'action': action, 'username': ig_user}
+        else:
+            return jsonify({'message': f'action no soportada: {action}'}), 400
 
     username = request.user['username']
     ok, tokens_restantes = consume_one_token(username, note=f'Tarea {task_type}')
