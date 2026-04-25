@@ -745,6 +745,40 @@ def generar_cookies():
 
 
 # --- Instagram (server-side, sin worker) ---
+def _ig_handle(fn, *args, charge_username=None, **kwargs):
+    """Wrapper común: comprueba saldo, ejecuta scraper, cobra al éxito."""
+    from instagram_scraper import (
+        InstagramBlockedError,
+        InstagramNotFoundError,
+        InstagramScrapeError,
+    )
+    user = request.user['username']
+    if charge_username:
+        with get_db() as conn:
+            row = conn.execute('SELECT tokens FROM usuarios WHERE username = ?', (user,)).fetchone()
+        if not row or (row['tokens'] or 0) <= 0:
+            return jsonify({'message': 'No tienes tokens disponibles.', 'tokens_restantes': 0}), 402
+    try:
+        result = fn(*args, **kwargs)
+    except InstagramNotFoundError as e:
+        return jsonify({'message': str(e), 'code': 'not_found'}), 404
+    except InstagramBlockedError as e:
+        log.warning('IG blocked: %s', e)
+        return jsonify({
+            'message': 'Instagram bloqueó la petición desde el servidor. '
+                       'Reintenta más tarde o usa el worker en tu PC.',
+            'code': 'instagram_blocked',
+        }), 502
+    except InstagramScrapeError as e:
+        log.warning('IG scrape error: %s', e)
+        return jsonify({'message': str(e), 'code': 'scrape_error'}), 502
+    payload = {'data': result}
+    if charge_username:
+        _ok, tokens_restantes = consume_one_token(user, note=charge_username)
+        payload['tokens_restantes'] = tokens_restantes
+    return jsonify(payload)
+
+
 @app.route('/api/instagram/profile', methods=['POST'])
 @require_auth
 def instagram_profile_endpoint():
@@ -806,6 +840,95 @@ def instagram_profile_endpoint():
         'profile': profile,
         'tokens_restantes': tokens_restantes,
     })
+
+
+# Tabs adicionales — cada llamada cuesta 1 token (igual que profile).
+@app.route('/api/instagram/feed', methods=['POST'])
+@require_auth
+def instagram_feed_endpoint():
+    from instagram_scraper import scrape_feed
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get('user_id') or '').strip()
+    max_id = data.get('max_id')
+    if not user_id.isdigit():
+        return jsonify({'message': 'user_id inválido.'}), 400
+    return _ig_handle(scrape_feed, user_id, max_id=max_id, charge_username='Instagram feed')
+
+
+@app.route('/api/instagram/stories', methods=['POST'])
+@require_auth
+def instagram_stories_endpoint():
+    from instagram_scraper import scrape_stories
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get('user_id') or '').strip()
+    if not user_id.isdigit():
+        return jsonify({'message': 'user_id inválido.'}), 400
+    return _ig_handle(scrape_stories, user_id, charge_username='Instagram stories')
+
+
+@app.route('/api/instagram/highlights', methods=['POST'])
+@require_auth
+def instagram_highlights_endpoint():
+    from instagram_scraper import scrape_highlights
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip().lstrip('@')
+    if not username:
+        return jsonify({'message': 'username inválido.'}), 400
+    return _ig_handle(scrape_highlights, username, charge_username='Instagram highlights')
+
+
+@app.route('/api/instagram/reels', methods=['POST'])
+@require_auth
+def instagram_reels_endpoint():
+    from instagram_scraper import scrape_reels
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get('user_id') or '').strip()
+    if not user_id.isdigit():
+        return jsonify({'message': 'user_id inválido.'}), 400
+    return _ig_handle(scrape_reels, user_id, charge_username='Instagram reels')
+
+
+@app.route('/api/instagram/tagged', methods=['POST'])
+@require_auth
+def instagram_tagged_endpoint():
+    from instagram_scraper import scrape_tagged
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip().lstrip('@')
+    if not username:
+        return jsonify({'message': 'username inválido.'}), 400
+    return _ig_handle(scrape_tagged, username, charge_username='Instagram tagged')
+
+
+# Image proxy — gratis, evita problemas de CORS/Origin con CDN de Instagram.
+@app.route('/api/instagram/image', methods=['GET'])
+def instagram_image_proxy():
+    from urllib.parse import urlparse
+
+    src = request.args.get('u', '')
+    if not src.startswith('https://'):
+        return jsonify({'message': 'url inválida'}), 400
+    host = urlparse(src).hostname or ''
+    # Solo CDNs conocidos de Instagram para evitar SSRF.
+    if not (host.endswith('cdninstagram.com') or host.endswith('fbcdn.net')):
+        return jsonify({'message': 'host no permitido'}), 400
+    try:
+        import requests as _req
+        upstream = _req.get(src, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/127.0',
+            'Referer': 'https://www.instagram.com/',
+        }, timeout=10, stream=True)
+    except Exception as e:
+        return jsonify({'message': f'fetch error: {e}'}), 502
+    if upstream.status_code != 200:
+        return jsonify({'message': f'upstream {upstream.status_code}'}), 502
+    from flask import Response
+    content_type = upstream.headers.get('Content-Type', 'image/jpeg')
+    return Response(
+        upstream.iter_content(chunk_size=8192),
+        status=200,
+        content_type=content_type,
+        headers={'Cache-Control': 'public, max-age=3600'},
+    )
 
 
 # --- Worker — heartbeat y cola ---

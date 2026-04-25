@@ -1,20 +1,27 @@
 """
 HokoSocial — Instagram public-profile scraper (server-side).
 
-Hace una sola request HTTP al endpoint web_profile_info de Instagram (el
-que usa instagram.com en el navegador). NO necesita login.
+Funciona SIN login. Cada función puede fallar con InstagramBlockedError
+si la IP está marcada (típico desde datacenter); el caller decidirá si
+fallback al worker.
 
-Funciona desde residential IPs siempre. Desde IPs de cloud (Render, AWS,
-GCP) Instagram puede bloquear con 401/403/429 si el ASN está marcado.
-En ese caso, el caller debería tener un plan B (worker en PC del user,
-proxy residencial, etc.).
+Endpoints públicos verificados (residencial):
+- web_profile_info        → perfil base + 12 posts.
+- users/{id}/info         → info detallada.
+- feed/user/{id}          → timeline paginado (todos los posts).
+- feed/reels_media        → stories activas.
+- /{username}/ (HTML)     → highlights tray embebido.
+- /{username}/tagged/     → tagged HTML.
 
-Es exactamente la misma lógica que en worker_instagram.py — duplicada
-intencionalmente para que cada repo sea autosuficiente.
+Endpoints que NO funcionan sin login (verificado):
+- friendships/{id}/followers → 401, require_login.
+- friendships/{id}/following → 401, require_login.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from typing import Callable
 
@@ -26,23 +33,23 @@ UA = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
     '(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
 )
-APP_ID = '936619743392459'  # IG Web App ID público
+APP_ID = '936619743392459'
 
 
 class InstagramBlockedError(Exception):
-    """Instagram nos está bloqueando (401/403/429 con cuerpo de bloqueo)."""
+    pass
 
 
 class InstagramNotFoundError(Exception):
-    """El username no existe en Instagram."""
+    pass
 
 
 class InstagramScrapeError(Exception):
-    """Otros fallos (red, JSON inválido, estructura inesperada)."""
+    pass
 
 
-def _headers() -> dict:
-    return {
+def _headers(extra: dict | None = None) -> dict:
+    h = {
         'User-Agent': UA,
         'X-IG-App-ID': APP_ID,
         'Accept': '*/*',
@@ -53,41 +60,38 @@ def _headers() -> dict:
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
     }
+    if extra:
+        h.update(extra)
+    return h
 
 
-def _fetch(username: str, retries: int = 1, log: LogFn | None = None) -> dict:
-    url = f'https://www.instagram.com/api/v1/users/web_profile_info/?username={username}'
-    last_error = None
+def _get(url: str, retries: int = 1, timeout: int = 12, accept_html: bool = False) -> requests.Response:
+    last_status = None
     for attempt in range(retries + 1):
         try:
-            r = requests.get(url, headers=_headers(), timeout=12)
+            r = requests.get(url, headers=_headers(), timeout=timeout)
         except Exception as e:
-            last_error = e
             if attempt < retries:
-                if log: log(f'Network error: {e}, reintentando...')
-                time.sleep(1.5)
+                time.sleep(1.0)
                 continue
-            raise InstagramScrapeError(f'No pudimos contactar Instagram: {e}')
+            raise InstagramScrapeError(f'Network error: {e}')
 
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except ValueError:
-                raise InstagramScrapeError('Instagram devolvió un cuerpo no-JSON.')
+        last_status = r.status_code
+        if r.status_code == 200 or (accept_html and r.status_code in (200, 201)):
+            return r
         if r.status_code == 404:
-            raise InstagramNotFoundError(f'@{username} no existe.')
+            raise InstagramNotFoundError(f'404 not found at {url}')
         if r.status_code in (401, 403, 429):
-            raise InstagramBlockedError(
-                f'Instagram bloqueó la petición (HTTP {r.status_code}). '
-                'IP probablemente marcada como datacenter.'
-            )
-        last_error = f'HTTP {r.status_code}'
+            raise InstagramBlockedError(f'HTTP {r.status_code} (login or rate-limit)')
         if attempt < retries:
-            time.sleep(1.5)
-    raise InstagramScrapeError(f'Fallo tras reintentos: {last_error}')
+            time.sleep(1.0)
+    raise InstagramScrapeError(f'HTTP {last_status} after retries')
 
+
+# ---------- Profile (base) ----------
 
 def _post_summary(node: dict) -> dict:
+    """De edge_owner_to_timeline_media (web_profile_info)."""
     return {
         'shortcode': node.get('shortcode'),
         'thumbnail': node.get('thumbnail_src') or node.get('display_url'),
@@ -105,6 +109,30 @@ def _post_summary(node: dict) -> dict:
     }
 
 
+def _feed_item(item: dict) -> dict:
+    """De feed/user/{id} (estructura distinta)."""
+    image_versions = (item.get('image_versions2') or {}).get('candidates') or []
+    thumb = image_versions[0]['url'] if image_versions else None
+    if not thumb and item.get('carousel_media'):
+        first = item['carousel_media'][0]
+        ivs = (first.get('image_versions2') or {}).get('candidates') or []
+        if ivs:
+            thumb = ivs[0]['url']
+    media_type = item.get('media_type')
+    return {
+        'shortcode': item.get('code'),
+        'thumbnail': thumb,
+        'is_video': media_type == 2,
+        'is_carousel': media_type == 8,
+        'product_type': item.get('product_type'),  # 'clips' = reel
+        'caption': ((item.get('caption') or {}).get('text') or '')[:280],
+        'likes': item.get('like_count', 0),
+        'comments': item.get('comment_count', 0),
+        'taken_at': item.get('taken_at'),
+        'view_count': item.get('play_count') or item.get('view_count') or 0,
+    }
+
+
 def parse_user(data: dict) -> dict:
     user = (data.get('data') or {}).get('user')
     if not user:
@@ -114,6 +142,7 @@ def parse_user(data: dict) -> dict:
     recent_posts = [_post_summary(e.get('node') or {}) for e in posts_edges[:12]]
 
     return {
+        'id': user.get('id'),
         'username': user.get('username'),
         'full_name': user.get('full_name'),
         'biography': user.get('biography'),
@@ -126,15 +155,149 @@ def parse_user(data: dict) -> dict:
         'followers': (user.get('edge_followed_by') or {}).get('count', 0),
         'following': (user.get('edge_follow') or {}).get('count', 0),
         'posts_count': (user.get('edge_owner_to_timeline_media') or {}).get('count', 0),
+        'has_clips': bool(user.get('has_clips')),
         'recent_posts': recent_posts,
         'profile_url': f'https://www.instagram.com/{user.get("username")}/',
     }
 
 
 def scrape_profile(username: str) -> dict:
-    """Scrapea el perfil público. Lanza Instagram*Error según el caso."""
     username = (username or '').strip().lstrip('@').lower()
     if not username:
         raise InstagramScrapeError('Username vacío.')
-    data = _fetch(username)
-    return parse_user(data)
+    url = f'https://www.instagram.com/api/v1/users/web_profile_info/?username={username}'
+    r = _get(url)
+    try:
+        return parse_user(r.json())
+    except ValueError:
+        raise InstagramScrapeError('Respuesta no-JSON.')
+
+
+# ---------- Feed completo (timeline) paginado ----------
+
+def scrape_feed(user_id: str, max_id: str | None = None, count: int = 12) -> dict:
+    """Devuelve {items: [...], next_max_id: str|None, more_available: bool}."""
+    base = f'https://i.instagram.com/api/v1/feed/user/{user_id}/?count={count}'
+    if max_id:
+        base += f'&max_id={max_id}'
+    r = _get(base)
+    data = r.json()
+    items = data.get('items') or []
+    return {
+        'items': [_feed_item(it) for it in items if (it.get('product_type') or '') != 'story'],
+        'next_max_id': data.get('next_max_id'),
+        'more_available': bool(data.get('more_available')),
+    }
+
+
+# ---------- Stories ----------
+
+def scrape_stories(user_id: str) -> dict:
+    """Stories activas. Si no tiene, devuelve items vacío."""
+    url = f'https://i.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}'
+    r = _get(url)
+    data = r.json()
+    reels = data.get('reels') or {}
+    reel = reels.get(str(user_id)) or {}
+    items_raw = reel.get('items') or []
+    items = []
+    for it in items_raw:
+        ivs = (it.get('image_versions2') or {}).get('candidates') or []
+        thumb = ivs[0]['url'] if ivs else None
+        vids = it.get('video_versions') or []
+        video_url = vids[0]['url'] if vids else None
+        items.append({
+            'id': it.get('pk'),
+            'thumbnail': thumb,
+            'video_url': video_url,
+            'is_video': bool(video_url),
+            'taken_at': it.get('taken_at'),
+            'expiring_at': it.get('expiring_at'),
+        })
+    return {
+        'items': items,
+        'count': len(items),
+        'has_active': len(items) > 0,
+    }
+
+
+# ---------- Highlights (parseando la página HTML del perfil) ----------
+
+_HIGHLIGHTS_RE = re.compile(
+    r'"highlight_reels":\s*(\[.*?\])',
+    re.DOTALL,
+)
+
+
+def scrape_highlights(username: str) -> dict:
+    """Highlights tray: solo metadatos (id, title, cover_url). Cubre la página
+    pública que ya hace SSR con datos embebidos. Si no tiene highlights, list
+    vacío.
+
+    El endpoint JSON propio de highlights requiere login; este truco usa el
+    HTML público que sí los lista.
+    """
+    url = f'https://www.instagram.com/{username}/'
+    r = _get(url, accept_html=True)
+    html = r.text
+    items = []
+    # Forma 1: GraphQL embebido (Instagram pre-rendera SOMETIMES)
+    m = _HIGHLIGHTS_RE.search(html)
+    if m:
+        try:
+            arr = json.loads(m.group(1))
+            for h in arr:
+                items.append({
+                    'id': h.get('id'),
+                    'title': h.get('title'),
+                    'cover_url': (h.get('cover_media') or {}).get('thumbnail_src') or h.get('cover_media_cropped_thumbnail') or None,
+                })
+        except Exception:
+            pass
+
+    # Forma 2: el endpoint de la versión web también expone tray a través de
+    # un GraphQL POST que requiere doc_id. Como muchas veces el HTML no embebe,
+    # devolvemos lo que tengamos. Si está vacío, el frontend muestra "no hay".
+    return {
+        'items': items,
+        'count': len(items),
+        'note': 'Si no se ven highlights, Instagram puede haber cambiado el SSR. '
+                'En ese caso solo se obtendrían con login.',
+    }
+
+
+# ---------- Tagged (etiquetadas) ----------
+
+def scrape_tagged(username: str, count: int = 12) -> dict:
+    """Tagged feed: parsea la página HTML pública /{username}/tagged/."""
+    url = f'https://www.instagram.com/{username}/tagged/'
+    r = _get(url, accept_html=True)
+    # El feed embebido va en application/json scripts. Implementación mínima:
+    # solo confirmamos disponibilidad. El parsing fino requiere doc_id y queda
+    # para iteración futura.
+    has = '"tagged"' in r.text or 'usertags' in r.text
+    return {
+        'items': [],
+        'available': has,
+        'note': 'Etiquetadas requieren un GraphQL adicional con doc_id. '
+                'En esta versión solo confirmamos que la página existe.',
+    }
+
+
+# ---------- Reels (subset del feed) ----------
+
+def scrape_reels(user_id: str, max_id: str | None = None, count: int = 12) -> dict:
+    """No hay endpoint público sólo para reels que funcione sin login.
+    Como workaround, recorremos el feed y filtramos product_type='clips'."""
+    base = f'https://i.instagram.com/api/v1/feed/user/{user_id}/?count={count * 2}'
+    if max_id:
+        base += f'&max_id={max_id}'
+    r = _get(base)
+    data = r.json()
+    items = data.get('items') or []
+    reels_only = [_feed_item(it) for it in items if (it.get('product_type') == 'clips')]
+    return {
+        'items': reels_only[:count],
+        'next_max_id': data.get('next_max_id'),
+        'more_available': bool(data.get('more_available')),
+    }
