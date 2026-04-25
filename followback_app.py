@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 import os
 import sqlite3
@@ -10,6 +11,13 @@ import jwt
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.security import check_password_hash, generate_password_hash
+
+# stripe es opcional: si no hay STRIPE_SECRET_KEY el módulo se carga pero los
+# endpoints /api/checkout y /api/stripe/webhook devuelven 503.
+try:
+    import stripe as stripe_lib
+except ImportError:
+    stripe_lib = None
 
 # --- Config ---
 app = Flask(__name__)
@@ -24,16 +32,37 @@ WORKER_API_KEY = os.environ.get('WORKER_API_KEY', '')
 if not WORKER_API_KEY:
     app.logger.warning('WORKER_API_KEY no definido — endpoints /api/worker rechazarán todo.')
 
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+STRIPE_ENABLED = bool(STRIPE_SECRET_KEY and stripe_lib)
+if STRIPE_ENABLED:
+    stripe_lib.api_key = STRIPE_SECRET_KEY
+else:
+    app.logger.info('Stripe no configurado — endpoints de pago devolverán 503.')
+
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://hokosocial.vercel.app').rstrip('/')
+
 cors_origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', 'https://hokosocial.vercel.app').split(',') if o.strip()]
 CORS(app, origins=cors_origins, supports_credentials=True)
 
 DB_PATH = os.environ.get('DB_PATH', 'usuarios.db')
 
-# Tipos de tarea soportados.
 TASK_TYPES = ('search', 'followback', 'simulate')
-WORKER_TYPES = ('search', 'followback')  # los que el worker debe procesar
-MAX_LOG_LINES = 2000  # cap por tarea para no descontrolar la DB
-WORKER_OFFLINE_AFTER = 30  # segundos sin heartbeat = offline
+WORKER_TYPES = ('search', 'followback')
+MAX_LOG_LINES = 2000
+WORKER_OFFLINE_AFTER = 30
+
+TERMS_VERSION = '2026-04-25'
+
+# Catálogo seed de paquetes (idempotente: si ya existen por slug, no duplica).
+DEFAULT_PACKS = [
+    {'slug': 'starter', 'name': 'Starter', 'tokens': 50, 'price_cents': 499, 'currency': 'eur',
+     'description': '50 ejecuciones — para probar.'},
+    {'slug': 'pro', 'name': 'Pro', 'tokens': 200, 'price_cents': 1499, 'currency': 'eur',
+     'description': '200 ejecuciones — el más popular.'},
+    {'slug': 'max', 'name': 'Max', 'tokens': 500, 'price_cents': 2999, 'currency': 'eur',
+     'description': '500 ejecuciones — para power users.'},
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +82,15 @@ def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
 
 
+def _try_alter(conn, sql: str):
+    """Intenta un ALTER TABLE; ignora si la columna ya existe."""
+    try:
+        conn.execute(sql)
+    except sqlite3.OperationalError as e:
+        if 'duplicate column' not in str(e).lower():
+            raise
+
+
 def init_db():
     with get_db() as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS usuarios (
@@ -61,6 +99,10 @@ def init_db():
             tokens INTEGER DEFAULT 5,
             rol TEXT DEFAULT 'user'
         )''')
+        # Migration: terms_accepted_at + stripe_customer_id
+        _try_alter(conn, 'ALTER TABLE usuarios ADD COLUMN terms_accepted_at TEXT')
+        _try_alter(conn, 'ALTER TABLE usuarios ADD COLUMN stripe_customer_id TEXT')
+
         conn.execute('''CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner TEXT NOT NULL,
@@ -74,6 +116,7 @@ def init_db():
         )''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status, created_at)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner, created_at)')
+
         conn.execute('''CREATE TABLE IF NOT EXISTS worker_status (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             last_seen TEXT,
@@ -81,11 +124,45 @@ def init_db():
         )''')
         conn.execute('INSERT OR IGNORE INTO worker_status (id) VALUES (1)')
 
+        conn.execute('''CREATE TABLE IF NOT EXISTS token_packs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            tokens INTEGER NOT NULL,
+            price_cents INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'eur',
+            is_active INTEGER NOT NULL DEFAULT 1
+        )''')
+        # Seed de packs (idempotente por slug)
+        for p in DEFAULT_PACKS:
+            conn.execute(
+                'INSERT OR IGNORE INTO token_packs (slug, name, description, tokens, price_cents, currency) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (p['slug'], p['name'], p['description'], p['tokens'], p['price_cents'], p['currency']),
+            )
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            tokens_delta INTEGER NOT NULL,
+            balance_after INTEGER NOT NULL,
+            note TEXT,
+            stripe_session_id TEXT,
+            created_at TEXT NOT NULL
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_tx_owner ON transactions (owner, created_at)')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_stripe ON transactions (stripe_session_id) '
+                     "WHERE stripe_session_id IS NOT NULL")
+
+        conn.commit()
+
 
 init_db()
 
 
-# --- Password hashing (compatible con passwords legacy en texto plano) ---
+# --- Password hashing ---
 def hash_password(plain: str) -> str:
     return generate_password_hash(plain)
 
@@ -120,7 +197,8 @@ def verificar_token(token: str):
 def get_user(username: str):
     with get_db() as conn:
         row = conn.execute(
-            'SELECT username, password, tokens, rol FROM usuarios WHERE username = ?',
+            'SELECT username, password, tokens, rol, terms_accepted_at, stripe_customer_id '
+            'FROM usuarios WHERE username = ?',
             (username,),
         ).fetchone()
         return dict(row) if row else None
@@ -163,23 +241,95 @@ def require_worker(fn):
     return wrapper
 
 
+# --- Wallet helpers (transactions) ---
+def add_transaction(conn, owner: str, kind: str, tokens_delta: int, balance_after: int,
+                    note: str | None = None, stripe_session_id: str | None = None) -> int:
+    """Crea una fila en transactions. Reusa la conexión del caller."""
+    cur = conn.execute(
+        'INSERT INTO transactions (owner, kind, tokens_delta, balance_after, note, stripe_session_id, created_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+        (owner, kind, tokens_delta, balance_after, note, stripe_session_id, now_iso()),
+    )
+    return cur.lastrowid
+
+
+def credit_tokens(username: str, amount: int, kind: str, note: str | None = None,
+                  stripe_session_id: str | None = None) -> tuple[bool, int]:
+    """Suma `amount` tokens a `username`. Idempotente respecto a stripe_session_id."""
+    if amount <= 0:
+        return False, 0
+    with get_db() as conn:
+        if stripe_session_id:
+            existing = conn.execute(
+                'SELECT id FROM transactions WHERE stripe_session_id = ?',
+                (stripe_session_id,),
+            ).fetchone()
+            if existing:
+                row = conn.execute(
+                    'SELECT tokens FROM usuarios WHERE username = ?', (username,)
+                ).fetchone()
+                return False, (row['tokens'] if row else 0)
+        conn.execute(
+            'UPDATE usuarios SET tokens = tokens + ? WHERE username = ?',
+            (amount, username),
+        )
+        row = conn.execute(
+            'SELECT tokens FROM usuarios WHERE username = ?', (username,)
+        ).fetchone()
+        if not row:
+            return False, 0
+        balance = row['tokens']
+        add_transaction(conn, username, kind, amount, balance, note, stripe_session_id)
+        conn.commit()
+    log.info('credited %d tokens to %s (kind=%s, balance=%d)', amount, username, kind, balance)
+    return True, balance
+
+
+def consume_one_token(username: str, note: str | None = None) -> tuple[bool, int]:
+    """Decrementa 1 token + crea transaction kind='consume'. Atómico."""
+    with get_db() as conn:
+        cur = conn.execute(
+            'UPDATE usuarios SET tokens = tokens - 1 WHERE username = ? AND tokens > 0',
+            (username,),
+        )
+        row = conn.execute(
+            'SELECT tokens FROM usuarios WHERE username = ?', (username,)
+        ).fetchone()
+        balance = row['tokens'] if row else 0
+        if cur.rowcount > 0:
+            add_transaction(conn, username, 'consume', -1, balance, note=note)
+            conn.commit()
+            return True, balance
+        conn.commit()
+    return False, balance
+
+
 # --- Auth endpoints ---
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip()
     password = data.get('password') or ''
+    accepted_terms = bool(data.get('accept_terms'))
+
     if not username or not password:
         return jsonify({'message': 'Usuario y contraseña son obligatorios'}), 400
     if len(password) < 6:
         return jsonify({'message': 'La contraseña debe tener al menos 6 caracteres'}), 400
+    if not accepted_terms:
+        return jsonify({'message': 'Debes aceptar los términos para crear la cuenta.'}), 400
 
     try:
         with get_db() as conn:
             conn.execute(
-                'INSERT INTO usuarios (username, password) VALUES (?, ?)',
-                (username, hash_password(password)),
+                'INSERT INTO usuarios (username, password, terms_accepted_at) VALUES (?, ?, ?)',
+                (username, hash_password(password), now_iso()),
             )
+            row = conn.execute(
+                'SELECT tokens FROM usuarios WHERE username = ?', (username,)
+            ).fetchone()
+            balance = row['tokens'] if row else 0
+            add_transaction(conn, username, 'grant', balance, balance, note='Tokens iniciales (signup)')
             conn.commit()
     except sqlite3.IntegrityError:
         return jsonify({'message': 'Usuario ya existe'}), 409
@@ -188,11 +338,11 @@ def register():
         return jsonify({'message': 'Error al registrar'}), 500
 
     log.info('register ok: %s', username)
-    return jsonify({'token': generar_token(username)}), 201
+    return jsonify({'token': generar_token(username), 'terms_version': TERMS_VERSION}), 201
 
 
 @app.route('/api/login', methods=['POST'])
-def login():
+def login_route():
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip()
     password = data.get('password') or ''
@@ -227,7 +377,151 @@ def login():
 @require_auth
 def user_data():
     u = request.user
-    return jsonify({'username': u['username'], 'tokens': u['tokens'], 'rol': u['rol']})
+    return jsonify({
+        'username': u['username'],
+        'tokens': u['tokens'],
+        'rol': u['rol'],
+        'terms_accepted_at': u.get('terms_accepted_at'),
+    })
+
+
+@app.route('/api/me/transactions', methods=['GET'])
+@require_auth
+def my_transactions():
+    limit = min(int(request.args.get('limit', 50)), 200)
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT id, kind, tokens_delta, balance_after, note, stripe_session_id, created_at '
+            'FROM transactions WHERE owner = ? ORDER BY id DESC LIMIT ?',
+            (request.user['username'], limit),
+        ).fetchall()
+    return jsonify({'transactions': [dict(r) for r in rows]})
+
+
+@app.route('/api/legal/terms', methods=['GET'])
+def legal_terms():
+    text = (
+        "HokoSocial — Términos & Disclaimer (v" + TERMS_VERSION + ")\n\n"
+        "1. Esta herramienta automatiza acciones en plataformas de terceros (Threads/Meta).\n"
+        "2. El usuario es el único responsable de su cuenta. HokoSocial no se hace responsable\n"
+        "   de bloqueos, suspensiones o limitaciones que las plataformas impongan a tu cuenta\n"
+        "   como consecuencia del uso de este servicio.\n"
+        "3. El uso intensivo o agresivo está desaconsejado. La herramienta intenta actuar de\n"
+        "   forma conservadora, pero las plataformas cambian sus reglas constantemente.\n"
+        "4. Los tokens adquiridos no son reembolsables salvo error técnico imputable al servicio.\n"
+        "5. No almacenamos credenciales de Threads/Meta. Las acciones se ejecutan únicamente\n"
+        "   con el consentimiento explícito del usuario y a través del canal autorizado por\n"
+        "   este (worker local o, en futuras versiones, importación de cookies).\n"
+        "6. Al crear una cuenta confirmas haber leído y aceptado estos términos."
+    )
+    return jsonify({'version': TERMS_VERSION, 'text': text})
+
+
+# --- Catálogo y compras ---
+@app.route('/api/packs', methods=['GET'])
+def list_packs():
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT slug, name, description, tokens, price_cents, currency '
+            'FROM token_packs WHERE is_active = 1 ORDER BY tokens ASC'
+        ).fetchall()
+    return jsonify({
+        'packs': [dict(r) for r in rows],
+        'stripe_enabled': STRIPE_ENABLED,
+    })
+
+
+@app.route('/api/checkout', methods=['POST'])
+@require_auth
+def create_checkout():
+    if not STRIPE_ENABLED:
+        return jsonify({'message': 'Pagos no habilitados todavía. Contacta con el admin.'}), 503
+
+    data = request.get_json(silent=True) or {}
+    slug = (data.get('slug') or '').strip()
+    if not slug:
+        return jsonify({'message': 'Falta slug del paquete.'}), 400
+
+    with get_db() as conn:
+        pack = conn.execute(
+            'SELECT slug, name, description, tokens, price_cents, currency '
+            'FROM token_packs WHERE slug = ? AND is_active = 1',
+            (slug,),
+        ).fetchone()
+    if not pack:
+        return jsonify({'message': 'Paquete no encontrado.'}), 404
+
+    success_url = f'{FRONTEND_URL}/account?status=success&session_id={{CHECKOUT_SESSION_ID}}'
+    cancel_url = f'{FRONTEND_URL}/account?status=cancelled'
+
+    try:
+        session = stripe_lib.checkout.Session.create(
+            mode='payment',
+            line_items=[{
+                'quantity': 1,
+                'price_data': {
+                    'currency': pack['currency'],
+                    'unit_amount': pack['price_cents'],
+                    'product_data': {
+                        'name': f'HokoSocial — {pack["name"]} ({pack["tokens"]} tokens)',
+                        'description': pack['description'] or '',
+                    },
+                },
+            }],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            client_reference_id=request.user['username'],
+            metadata={
+                'username': request.user['username'],
+                'pack_slug': pack['slug'],
+                'tokens': str(pack['tokens']),
+            },
+        )
+    except Exception as e:
+        log.exception('stripe checkout failed: %s', e)
+        return jsonify({'message': 'No pudimos iniciar el pago. Inténtalo en unos minutos.'}), 502
+
+    return jsonify({'url': session.url, 'id': session.id})
+
+
+@app.route('/api/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    if not STRIPE_ENABLED:
+        return jsonify({'message': 'Stripe no configurado'}), 503
+
+    payload = request.get_data(as_text=False)
+    sig_header = request.headers.get('Stripe-Signature', '')
+
+    try:
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe_lib.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        else:
+            # En dev sin webhook secret, parseamos confiando en la firma TLS de Stripe.
+            log.warning('STRIPE_WEBHOOK_SECRET no definido — verificación de firma desactivada.')
+            event = json.loads(payload)
+    except (ValueError, getattr(stripe_lib, 'error', type('E', (), {})).SignatureVerificationError if stripe_lib else ValueError) as e:
+        log.warning('webhook firma inválida: %s', e)
+        return jsonify({'message': 'invalid signature'}), 400
+
+    etype = event.get('type') if isinstance(event, dict) else event['type']
+    data_obj = event['data']['object'] if isinstance(event, dict) else event.data.object
+
+    if etype == 'checkout.session.completed':
+        session_id = data_obj.get('id') if isinstance(data_obj, dict) else data_obj.id
+        meta = data_obj.get('metadata') if isinstance(data_obj, dict) else (data_obj.metadata or {})
+        username = (meta or {}).get('username')
+        tokens = int((meta or {}).get('tokens') or 0)
+        pack_slug = (meta or {}).get('pack_slug', '?')
+        if username and tokens > 0:
+            credit_tokens(
+                username, tokens, 'purchase',
+                note=f'Compra de paquete {pack_slug}',
+                stripe_session_id=session_id,
+            )
+        else:
+            log.warning('checkout.session.completed sin metadata útil: %s', meta)
+
+    return jsonify({'received': True})
 
 
 # --- Helpers de tareas ---
@@ -257,21 +551,7 @@ def append_log_lines(task_id: int, lines):
         conn.commit()
 
 
-def consume_one_token(username: str):
-    """Decrementa 1 token atómicamente. Devuelve (ok, tokens_restantes)."""
-    with get_db() as conn:
-        cur = conn.execute(
-            'UPDATE usuarios SET tokens = tokens - 1 WHERE username = ? AND tokens > 0',
-            (username,),
-        )
-        conn.commit()
-        row = conn.execute('SELECT tokens FROM usuarios WHERE username = ?', (username,)).fetchone()
-        tokens = row['tokens'] if row else 0
-    return cur.rowcount > 0, tokens
-
-
 def run_simulation(task_id: int):
-    """Simulación local: para cuando no hay worker conectado o type=simulate."""
     try:
         append_log_lines(task_id, ['🔄 Ejecutando bot (simulación)...'])
         for i in range(3):
@@ -294,7 +574,7 @@ def run_simulation(task_id: int):
             conn.commit()
 
 
-# --- Bot — endpoints de usuario ---
+# --- Bot endpoints de usuario ---
 @app.route('/api/tasks', methods=['POST'])
 @require_auth
 def create_task():
@@ -304,7 +584,7 @@ def create_task():
         return jsonify({'message': f"type debe ser uno de: {', '.join(TASK_TYPES)}"}), 400
 
     username = request.user['username']
-    ok, tokens_restantes = consume_one_token(username)
+    ok, tokens_restantes = consume_one_token(username, note=f'Tarea {task_type}')
     if not ok:
         return jsonify({
             'message': 'No tienes tokens disponibles',
@@ -354,7 +634,6 @@ def get_task(task_id):
 @app.route('/api/tasks', methods=['GET'])
 @require_auth
 def list_tasks():
-    """Últimas N tareas del usuario, sin log para que sea ligero."""
     limit = min(int(request.args.get('limit', 20)), 100)
     with get_db() as conn:
         rows = conn.execute(
@@ -369,7 +648,7 @@ def list_tasks():
 def run_bot_legacy():
     """Compat: encola un simulate y devuelve el contrato anterior."""
     username = request.user['username']
-    ok, tokens_restantes = consume_one_token(username)
+    ok, tokens_restantes = consume_one_token(username, note='Tarea simulate (legacy)')
     if not ok:
         return jsonify({
             'message': 'No tienes tokens disponibles',
@@ -395,7 +674,6 @@ def run_bot_legacy():
 @app.route('/api/log', methods=['GET'])
 @require_auth
 def get_log_legacy():
-    """Compat: devuelve el log de la última tarea del usuario."""
     username = request.user['username']
     with get_db() as conn:
         row = conn.execute(
@@ -425,10 +703,7 @@ def generar_cookies():
 @require_worker
 def worker_heartbeat():
     with get_db() as conn:
-        conn.execute(
-            'UPDATE worker_status SET last_seen = ? WHERE id = 1',
-            (now_iso(),),
-        )
+        conn.execute('UPDATE worker_status SET last_seen = ? WHERE id = 1', (now_iso(),))
         conn.commit()
     return jsonify({'ok': True, 'server_time': now_iso()})
 
@@ -436,10 +711,8 @@ def worker_heartbeat():
 @app.route('/api/worker/next', methods=['POST'])
 @require_worker
 def worker_next():
-    """Saca atómicamente la siguiente tarea queued procesable por el worker."""
     placeholders = ','.join('?' for _ in WORKER_TYPES)
     with get_db() as conn:
-        # Atómico: actualiza la primera queued matcheable a running, devuelve su id.
         row = conn.execute(
             f"SELECT id FROM tasks WHERE status='queued' AND type IN ({placeholders}) "
             "ORDER BY id ASC LIMIT 1",
@@ -458,7 +731,6 @@ def worker_next():
             (now_iso(), task_id),
         )
         if cur.rowcount == 0:
-            # Otra carrera la cogió; reintentamos en el próximo ciclo.
             return jsonify({'task': None})
         conn.execute(
             'UPDATE worker_status SET last_seen = ?, current_task_id = ? WHERE id = 1',
@@ -512,7 +784,6 @@ def worker_finish(task_id):
 @app.route('/api/worker/status', methods=['GET'])
 @require_auth
 def worker_status_endpoint():
-    """Estado del worker para el dashboard. Solo requiere auth de usuario."""
     with get_db() as conn:
         row = conn.execute('SELECT last_seen, current_task_id FROM worker_status WHERE id = 1').fetchone()
     if not row or not row['last_seen']:
@@ -571,6 +842,36 @@ def admin_update_user():
         conn.commit()
     log.info('admin %s updated %s: %s', request.user['username'], username, data)
     return jsonify({'message': 'Usuario actualizado'})
+
+
+@app.route('/api/admin/grant-tokens', methods=['POST'])
+@require_admin
+def admin_grant_tokens():
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    try:
+        amount = int(data.get('amount'))
+    except (TypeError, ValueError):
+        return jsonify({'message': 'amount debe ser un entero'}), 400
+    note = data.get('note') or f"Concedido por admin {request.user['username']}"
+    if not username:
+        return jsonify({'message': 'username es obligatorio'}), 400
+    if amount == 0:
+        return jsonify({'message': 'amount no puede ser 0'}), 400
+    if not get_user(username):
+        return jsonify({'message': 'Usuario no encontrado'}), 404
+
+    if amount > 0:
+        ok, balance = credit_tokens(username, amount, 'grant', note=note)
+        return jsonify({'ok': ok, 'balance': balance})
+    # amount negativo: regalo inverso (corrección)
+    with get_db() as conn:
+        conn.execute('UPDATE usuarios SET tokens = MAX(0, tokens + ?) WHERE username = ?', (amount, username))
+        row = conn.execute('SELECT tokens FROM usuarios WHERE username = ?', (username,)).fetchone()
+        balance = row['tokens'] if row else 0
+        add_transaction(conn, username, 'refund', amount, balance, note=note)
+        conn.commit()
+    return jsonify({'ok': True, 'balance': balance})
 
 
 @app.route('/api/admin/delete-user/<username>', methods=['DELETE'])

@@ -2,6 +2,7 @@ gunicorn
 flask
 flask-cors
 pyjwt
+stripe
 selenium
 webdriver-manager
 chromedriver-autoinstaller
