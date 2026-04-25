@@ -744,6 +744,70 @@ def generar_cookies():
     return jsonify({'message': 'La generación de cookies aún no está implementada en el servidor.'}), 501
 
 
+# --- Instagram (server-side, sin worker) ---
+@app.route('/api/instagram/profile', methods=['POST'])
+@require_auth
+def instagram_profile_endpoint():
+    """Scrapea un perfil público de Instagram desde el servidor.
+
+    Si Instagram bloquea la IP (datacenter), devuelve 502 con código
+    `instagram_blocked` para que el frontend pueda ofrecer caer a una
+    tarea procesada por el worker en PC del usuario.
+
+    Cobra 1 token solo si la operación es exitosa (devuelve 200) o si
+    el username no existe (404, no es culpa nuestra). En caso de bloqueo
+    o error de red NO cobra el token.
+    """
+    from instagram_scraper import (
+        InstagramBlockedError,
+        InstagramNotFoundError,
+        InstagramScrapeError,
+        scrape_profile,
+    )
+
+    data = request.get_json(silent=True) or {}
+    username_in = (data.get('username') or '').strip().lstrip('@')
+    if not username_in or not username_in.replace('.', '').replace('_', '').isalnum():
+        return jsonify({'message': 'username inválido.'}), 400
+
+    # Comprueba saldo antes de scrapear (sin consumir todavía).
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT tokens FROM usuarios WHERE username = ?',
+            (request.user['username'],),
+        ).fetchone()
+    if not row or (row['tokens'] or 0) <= 0:
+        return jsonify({
+            'message': 'No tienes tokens disponibles.',
+            'tokens_restantes': 0,
+        }), 402
+
+    # Intentamos scrapear ANTES de cobrar para no quemar token si Instagram bloquea.
+    try:
+        profile = scrape_profile(username_in)
+    except InstagramNotFoundError as e:
+        # No cobra: el usuario no existe.
+        return jsonify({'message': str(e), 'code': 'not_found'}), 404
+    except InstagramBlockedError as e:
+        log.warning('IG blocked from this IP: %s', e)
+        return jsonify({
+            'message': 'Instagram está bloqueando nuestras peticiones desde el servidor. '
+                       'Tu worker local podría conseguirlo desde tu IP residencial — '
+                       'arranca worker.bat y reintenta.',
+            'code': 'instagram_blocked',
+        }), 502
+    except InstagramScrapeError as e:
+        log.warning('IG scrape error: %s', e)
+        return jsonify({'message': str(e), 'code': 'scrape_error'}), 502
+
+    # Solo cobramos cuando la query salió bien.
+    _ok, tokens_restantes = consume_one_token(request.user['username'], note=f'Instagram @{username_in}')
+    return jsonify({
+        'profile': profile,
+        'tokens_restantes': tokens_restantes,
+    })
+
+
 # --- Worker — heartbeat y cola ---
 @app.route('/api/worker/heartbeat', methods=['POST'])
 @require_worker

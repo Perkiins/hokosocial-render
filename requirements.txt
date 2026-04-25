@@ -3,6 +3,7 @@ flask
 flask-cors
 pyjwt
 stripe
+requests
 selenium
 webdriver-manager
 chromedriver-autoinstaller
