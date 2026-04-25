@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.local
+
+# Logs
+log_*.txt
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# NOTE: usuarios.db NO se ignora a propósito.
+# Render usa filesystem efímero — al redesplegar se pierde lo que no esté en el repo.
+# Migrar a Render Disk persistente o Postgres antes de moverlo aquí.
