@@ -163,22 +163,75 @@ def init_db():
 
 
 def bootstrap_admin():
-    """Si BOOTSTRAP_ADMIN_USERNAME está definido, garantiza que ese user sea admin
-    en cada arranque. Útil cuando la DB es efímera (Render free tier) y hay que
-    promover al owner del servicio sin acceso shell."""
+    """En cada arranque garantiza que el owner del servicio tenga su cuenta
+    admin con un saldo mínimo. Útil mientras el filesystem de Render es
+    efímero — sobrevive a redeploys.
+
+    Variables de entorno:
+    - BOOTSTRAP_ADMIN_USERNAME: si existe el user, se promueve a admin.
+    - BOOTSTRAP_ADMIN_PASSWORD (opcional): si la cuenta no existe, se crea
+      con esta password (hasheada). Si el user ya existe NO se toca su pwd.
+    - BOOTSTRAP_ADMIN_TOKENS (opcional, default 0): asegura que el saldo sea
+      al menos N. Si está más bajo, se eleva hasta N (y se registra en
+      transactions kind='grant' para auditoría).
+    """
     target = os.environ.get('BOOTSTRAP_ADMIN_USERNAME', '').strip()
     if not target:
         return
+    boot_pwd = os.environ.get('BOOTSTRAP_ADMIN_PASSWORD', '')
+    try:
+        boot_min_tokens = int(os.environ.get('BOOTSTRAP_ADMIN_TOKENS', '0') or 0)
+    except ValueError:
+        boot_min_tokens = 0
+
     with get_db() as conn:
-        cur = conn.execute('UPDATE usuarios SET rol = ? WHERE username = ? AND rol != ?',
-                           ('admin', target, 'admin'))
-        conn.commit()
-        if cur.rowcount > 0:
+        row = conn.execute(
+            'SELECT username, tokens, rol FROM usuarios WHERE username = ?',
+            (target,),
+        ).fetchone()
+
+        # 1) Crear si no existe (solo si tenemos password)
+        if not row and boot_pwd:
+            try:
+                conn.execute(
+                    'INSERT INTO usuarios (username, password, rol, tokens, terms_accepted_at) '
+                    'VALUES (?, ?, ?, ?, ?)',
+                    (target, hash_password(boot_pwd), 'admin',
+                     max(boot_min_tokens, 0), now_iso()),
+                )
+                row2 = conn.execute('SELECT tokens FROM usuarios WHERE username = ?', (target,)).fetchone()
+                add_transaction(conn, target, 'grant', row2['tokens'], row2['tokens'],
+                                note='Bootstrap admin (user creado automáticamente)')
+                conn.commit()
+                log.info('bootstrap_admin: %s creado con %d tokens', target, row2['tokens'])
+                return
+            except Exception:
+                log.exception('bootstrap_admin: fallo creando %s', target)
+                return
+        if not row:
+            log.warning('bootstrap_admin: %s no existe y no hay BOOTSTRAP_ADMIN_PASSWORD para crearlo', target)
+            return
+
+        # 2) Promover a admin si no lo es
+        if row['rol'] != 'admin':
+            conn.execute('UPDATE usuarios SET rol = ? WHERE username = ?', ('admin', target))
             log.info('bootstrap_admin: %s promovido a admin', target)
+
+        # 3) Asegurar saldo mínimo
+        if boot_min_tokens > 0 and (row['tokens'] or 0) < boot_min_tokens:
+            delta = boot_min_tokens - (row['tokens'] or 0)
+            conn.execute('UPDATE usuarios SET tokens = ? WHERE username = ?',
+                         (boot_min_tokens, target))
+            add_transaction(conn, target, 'grant', delta, boot_min_tokens,
+                            note=f'Bootstrap admin (saldo asegurado {boot_min_tokens})')
+            log.info('bootstrap_admin: %s saldo elevado a %d (+%d)', target, boot_min_tokens, delta)
+
+        conn.commit()
 
 
 init_db()
-bootstrap_admin()
+# bootstrap_admin() se llama al final del módulo (después de definir
+# hash_password y add_transaction).
 
 
 # --- Password hashing ---
@@ -1163,6 +1216,11 @@ def method_not_allowed(_):
 def server_error(e):
     log.exception('500: %s', e)
     return jsonify({'message': 'Error interno del servidor'}), 500
+
+
+# Bootstrap se ejecuta tras tener todas las funciones definidas (hash_password,
+# add_transaction). Va al final del módulo a propósito.
+bootstrap_admin()
 
 
 if __name__ == '__main__':
