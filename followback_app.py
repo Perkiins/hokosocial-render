@@ -47,8 +47,8 @@ CORS(app, origins=cors_origins, supports_credentials=True)
 
 DB_PATH = os.environ.get('DB_PATH', 'usuarios.db')
 
-TASK_TYPES = ('search', 'followback', 'simulate')
-WORKER_TYPES = ('search', 'followback')
+TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile')
+WORKER_TYPES = ('search', 'followback', 'instagram_profile')
 MAX_LOG_LINES = 2000
 WORKER_OFFLINE_AFTER = 30
 
@@ -114,6 +114,9 @@ def init_db():
             error TEXT,
             log TEXT NOT NULL DEFAULT ''
         )''')
+        # Migration: payload + result (JSON serializado)
+        _try_alter(conn, 'ALTER TABLE tasks ADD COLUMN payload TEXT')
+        _try_alter(conn, 'ALTER TABLE tasks ADD COLUMN result TEXT')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status, created_at)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks (owner, created_at)')
 
@@ -548,6 +551,23 @@ def task_to_dict(row, include_log=True):
         d['log_lines'] = [l for l in log_text.split('\n') if l]
     else:
         d.pop('log', None)
+    # payload / result son JSON, los devolvemos parseados al cliente.
+    raw_payload = d.pop('payload', None)
+    if raw_payload:
+        try:
+            d['payload'] = json.loads(raw_payload)
+        except Exception:
+            d['payload'] = None
+    else:
+        d['payload'] = None
+    raw_result = d.pop('result', None)
+    if raw_result:
+        try:
+            d['result'] = json.loads(raw_result)
+        except Exception:
+            d['result'] = None
+    else:
+        d['result'] = None
     return d
 
 
@@ -596,8 +616,16 @@ def run_simulation(task_id: int):
 def create_task():
     data = request.get_json(silent=True) or {}
     task_type = (data.get('type') or 'simulate').strip()
+    payload = data.get('payload')
     if task_type not in TASK_TYPES:
         return jsonify({'message': f"type debe ser uno de: {', '.join(TASK_TYPES)}"}), 400
+
+    # Validaciones por tipo
+    if task_type == 'instagram_profile':
+        ig_user = ((payload or {}).get('username') or '').strip().lstrip('@')
+        if not ig_user or not ig_user.replace('.', '').replace('_', '').isalnum():
+            return jsonify({'message': 'username de Instagram inválido.'}), 400
+        payload = {'username': ig_user}
 
     username = request.user['username']
     ok, tokens_restantes = consume_one_token(username, note=f'Tarea {task_type}')
@@ -607,10 +635,12 @@ def create_task():
             'tokens_restantes': tokens_restantes,
         }), 402
 
+    payload_json = json.dumps(payload) if payload is not None else None
+
     with get_db() as conn:
         cur = conn.execute(
-            'INSERT INTO tasks (owner, type, status, created_at) VALUES (?, ?, ?, ?)',
-            (username, task_type, 'queued', now_iso()),
+            'INSERT INTO tasks (owner, type, status, created_at, payload) VALUES (?, ?, ?, ?, ?)',
+            (username, task_type, 'queued', now_iso(), payload_json),
         )
         conn.commit()
         task_id = cur.lastrowid
@@ -770,6 +800,27 @@ def worker_log(task_id):
     with get_db() as conn:
         conn.execute('UPDATE worker_status SET last_seen = ? WHERE id = 1', (now_iso(),))
         conn.commit()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/worker/<int:task_id>/result', methods=['POST'])
+@require_worker
+def worker_result(task_id):
+    """El worker guarda un dict de resultado estructurado (ej. perfil Instagram)."""
+    data = request.get_json(silent=True) or {}
+    result = data.get('result')
+    if result is None:
+        return jsonify({'message': 'Falta result.'}), 400
+    try:
+        serialized = json.dumps(result)
+    except Exception:
+        return jsonify({'message': 'result no serializable a JSON'}), 400
+    with get_db() as conn:
+        cur = conn.execute('UPDATE tasks SET result = ? WHERE id = ?', (serialized, task_id))
+        conn.execute('UPDATE worker_status SET last_seen = ? WHERE id = 1', (now_iso(),))
+        conn.commit()
+    if cur.rowcount == 0:
+        return jsonify({'message': 'Tarea no encontrada'}), 404
     return jsonify({'ok': True})
 
 
