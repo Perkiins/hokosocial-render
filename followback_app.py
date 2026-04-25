@@ -51,6 +51,7 @@ TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile')
 WORKER_TYPES = ('search', 'followback', 'instagram_profile')
 MAX_LOG_LINES = 2000
 WORKER_OFFLINE_AFTER = 30
+ZOMBIE_TASK_AFTER = 300  # 5 min sin update => zombie, se auto-failea
 
 TERMS_VERSION = '2026-04-25'
 
@@ -994,11 +995,34 @@ def worker_heartbeat():
     return jsonify({'ok': True, 'server_time': now_iso()})
 
 
+def cleanup_zombie_tasks(conn) -> int:
+    """Marca como 'failed' las tareas que llevan >ZOMBIE_TASK_AFTER segundos
+    en 'running' y resetea worker_status.current_task_id si apuntaba a una."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(seconds=ZOMBIE_TASK_AFTER)
+              ).isoformat(timespec='seconds') + 'Z'
+    cur = conn.execute(
+        "UPDATE tasks SET status='failed', finished_at=?, "
+        "error='Tarea zombie: el worker no reportó progreso en ' || ? || 's. Auto-cancelada.' "
+        "WHERE status='running' AND started_at IS NOT NULL AND started_at < ?",
+        (now_iso(), ZOMBIE_TASK_AFTER, cutoff),
+    )
+    if cur.rowcount > 0:
+        log.info('cleanup_zombie_tasks: %d tareas marcadas como failed', cur.rowcount)
+        conn.execute(
+            'UPDATE worker_status SET current_task_id = NULL WHERE id = 1 AND '
+            'current_task_id NOT IN (SELECT id FROM tasks WHERE status = "running")',
+        )
+    return cur.rowcount
+
+
 @app.route('/api/worker/next', methods=['POST'])
 @require_worker
 def worker_next():
     placeholders = ','.join('?' for _ in WORKER_TYPES)
     with get_db() as conn:
+        # Limpia tareas zombie antes de coger una nueva — protege contra
+        # workers que crashearon sin reportar finish.
+        cleanup_zombie_tasks(conn)
         row = conn.execute(
             f"SELECT id FROM tasks WHERE status='queued' AND type IN ({placeholders}) "
             "ORDER BY id ASC LIMIT 1",
@@ -1092,6 +1116,10 @@ def worker_finish(task_id):
 @require_auth
 def worker_status_endpoint():
     with get_db() as conn:
+        # Auto-cleanup en cada poll (barato): si el worker está marcado como
+        # ocupado pero la tarea es zombie, la failamos para destrabar.
+        cleanup_zombie_tasks(conn)
+        conn.commit()
         row = conn.execute('SELECT last_seen, current_task_id FROM worker_status WHERE id = 1').fetchone()
     if not row or not row['last_seen']:
         return jsonify({'connected': False, 'last_seen': None, 'current_task_id': None})
@@ -1149,6 +1177,16 @@ def admin_update_user():
         conn.commit()
     log.info('admin %s updated %s: %s', request.user['username'], username, data)
     return jsonify({'message': 'Usuario actualizado'})
+
+
+@app.route('/api/admin/cleanup-zombies', methods=['POST'])
+@require_admin
+def admin_cleanup_zombies():
+    """Fuerza el barrido de tareas zombie."""
+    with get_db() as conn:
+        n = cleanup_zombie_tasks(conn)
+        conn.commit()
+    return jsonify({'failed': n, 'message': f'{n} tareas marcadas como failed.'})
 
 
 @app.route('/api/admin/grant-tokens', methods=['POST'])
