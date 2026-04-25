@@ -159,7 +159,23 @@ def init_db():
         conn.commit()
 
 
+def bootstrap_admin():
+    """Si BOOTSTRAP_ADMIN_USERNAME está definido, garantiza que ese user sea admin
+    en cada arranque. Útil cuando la DB es efímera (Render free tier) y hay que
+    promover al owner del servicio sin acceso shell."""
+    target = os.environ.get('BOOTSTRAP_ADMIN_USERNAME', '').strip()
+    if not target:
+        return
+    with get_db() as conn:
+        cur = conn.execute('UPDATE usuarios SET rol = ? WHERE username = ? AND rol != ?',
+                           ('admin', target, 'admin'))
+        conn.commit()
+        if cur.rowcount > 0:
+            log.info('bootstrap_admin: %s promovido a admin', target)
+
+
 init_db()
+bootstrap_admin()
 
 
 # --- Password hashing ---
