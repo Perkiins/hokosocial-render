@@ -160,6 +160,20 @@ def init_db():
         conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_stripe ON transactions (stripe_session_id) '
                      "WHERE stripe_session_id IS NOT NULL")
 
+        conn.execute('''CREATE TABLE IF NOT EXISTS bot_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            cookies TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            added_at TEXT NOT NULL,
+            last_used_at TEXT,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            burn_reason TEXT,
+            burned_at TEXT,
+            notes TEXT
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_bot_status ON bot_accounts (status, last_used_at)')
+
         conn.commit()
 
 
@@ -815,41 +829,7 @@ def generar_cookies():
     return jsonify({'message': 'La generación de cookies aún no está implementada en el servidor.'}), 501
 
 
-# --- Instagram (server-side, sin worker) ---
-def _ig_handle(fn, *args, charge_username=None, **kwargs):
-    """Wrapper común: comprueba saldo, ejecuta scraper, cobra al éxito."""
-    from instagram_scraper import (
-        InstagramBlockedError,
-        InstagramNotFoundError,
-        InstagramScrapeError,
-    )
-    user = request.user['username']
-    if charge_username:
-        with get_db() as conn:
-            row = conn.execute('SELECT tokens FROM usuarios WHERE username = ?', (user,)).fetchone()
-        if not row or (row['tokens'] or 0) <= 0:
-            return jsonify({'message': 'No tienes tokens disponibles.', 'tokens_restantes': 0}), 402
-    try:
-        result = fn(*args, **kwargs)
-    except InstagramNotFoundError as e:
-        return jsonify({'message': str(e), 'code': 'not_found'}), 404
-    except InstagramBlockedError as e:
-        log.warning('IG blocked: %s', e)
-        return jsonify({
-            'message': 'Instagram bloqueó la petición desde el servidor. '
-                       'Reintenta más tarde o usa el worker en tu PC.',
-            'code': 'instagram_blocked',
-        }), 502
-    except InstagramScrapeError as e:
-        log.warning('IG scrape error: %s', e)
-        return jsonify({'message': str(e), 'code': 'scrape_error'}), 502
-    payload = {'data': result}
-    if charge_username:
-        _ok, tokens_restantes = consume_one_token(user, note=charge_username)
-        payload['tokens_restantes'] = tokens_restantes
-    return jsonify(payload)
-
-
+# --- Instagram (server-side, con pool de cuentas-bot) ---
 @app.route('/api/instagram/profile', methods=['POST'])
 @require_auth
 def instagram_profile_endpoint():
@@ -888,22 +868,41 @@ def instagram_profile_endpoint():
         }), 402
 
     # Intentamos scrapear ANTES de cobrar para no quemar token si Instagram bloquea.
-    try:
-        profile = scrape_profile(username_in)
-    except InstagramNotFoundError as e:
-        # No cobra: el usuario no existe.
-        return jsonify({'message': str(e), 'code': 'not_found'}), 404
-    except InstagramBlockedError as e:
-        log.warning('IG blocked from this IP: %s', e)
+    # Si hay cuentas-bot activas, usamos su cookie (libera bloqueo IP de Render).
+    from instagram_scraper import InstagramAuthExpiredError
+    profile = None
+    last_block_error = None
+    for _ in range(5):
+        bot = pick_bot_account()
+        cookies = bot['cookies'] if bot else None
+        try:
+            profile = scrape_profile(username_in, cookies=cookies)
+            break
+        except InstagramNotFoundError as e:
+            return jsonify({'message': str(e), 'code': 'not_found'}), 404
+        except InstagramAuthExpiredError as e:
+            if bot:
+                burn_bot_account(bot['id'], str(e))
+            continue
+        except InstagramBlockedError as e:
+            last_block_error = str(e)
+            if bot is None:
+                # Sin cookies y bloqueado → caemos al worker desde el frontend.
+                log.warning('IG blocked anonymous: %s', e)
+                return jsonify({
+                    'message': 'Instagram está bloqueando peticiones anónimas desde el servidor. '
+                               'Configura una cuenta-bot o usa el worker en tu PC.',
+                    'code': 'instagram_blocked',
+                }), 502
+            continue
+        except InstagramScrapeError as e:
+            log.warning('IG scrape error: %s', e)
+            return jsonify({'message': str(e), 'code': 'scrape_error'}), 502
+    if profile is None:
         return jsonify({
-            'message': 'Instagram está bloqueando nuestras peticiones desde el servidor. '
-                       'Tu worker local podría conseguirlo desde tu IP residencial — '
-                       'arranca worker.bat y reintenta.',
-            'code': 'instagram_blocked',
-        }), 502
-    except InstagramScrapeError as e:
-        log.warning('IG scrape error: %s', e)
-        return jsonify({'message': str(e), 'code': 'scrape_error'}), 502
+            'message': f'Pool de cuentas-bot agotado. Último error: {last_block_error}',
+            'code': 'pool_exhausted',
+        }), 503
 
     # Solo cobramos cuando la query salió bien.
     _ok, tokens_restantes = consume_one_token(request.user['username'], note=f'Instagram @{username_in}')
@@ -917,57 +916,299 @@ def instagram_profile_endpoint():
 @app.route('/api/instagram/feed', methods=['POST'])
 @require_auth
 def instagram_feed_endpoint():
+    """Feed paginado. Usa pool si hay cuentas-bot; si no, intenta anónimo."""
     from instagram_scraper import scrape_feed
     data = request.get_json(silent=True) or {}
     user_id = (data.get('user_id') or '').strip()
+    if not user_id.isdigit():
+        return jsonify({'message': 'user_id inválido.'}), 400
     max_id = data.get('max_id')
-    if not user_id.isdigit():
-        return jsonify({'message': 'user_id inválido.'}), 400
-    return _ig_handle(scrape_feed, user_id, max_id=max_id, charge_username='Instagram feed')
-
-
-@app.route('/api/instagram/stories', methods=['POST'])
-@require_auth
-def instagram_stories_endpoint():
-    from instagram_scraper import scrape_stories
-    data = request.get_json(silent=True) or {}
-    user_id = (data.get('user_id') or '').strip()
-    if not user_id.isdigit():
-        return jsonify({'message': 'user_id inválido.'}), 400
-    return _ig_handle(scrape_stories, user_id, charge_username='Instagram stories')
-
-
-@app.route('/api/instagram/highlights', methods=['POST'])
-@require_auth
-def instagram_highlights_endpoint():
-    from instagram_scraper import scrape_highlights
-    data = request.get_json(silent=True) or {}
-    username = (data.get('username') or '').strip().lstrip('@')
-    if not username:
-        return jsonify({'message': 'username inválido.'}), 400
-    return _ig_handle(scrape_highlights, username, charge_username='Instagram highlights')
+    return _ig_authenticated(
+        scrape_feed, user_id, max_id, charge_note='Instagram feed',
+        allow_anonymous_fallback=True,
+    )
 
 
 @app.route('/api/instagram/reels', methods=['POST'])
 @require_auth
 def instagram_reels_endpoint():
+    """Reels: intenta con cuenta-bot del pool (libera bloqueo IP de Render).
+    Si no hay pool, fallback anónimo (puede dar instagram_blocked desde cloud)."""
     from instagram_scraper import scrape_reels
     data = request.get_json(silent=True) or {}
     user_id = (data.get('user_id') or '').strip()
     if not user_id.isdigit():
         return jsonify({'message': 'user_id inválido.'}), 400
-    return _ig_handle(scrape_reels, user_id, charge_username='Instagram reels')
+    max_id = data.get('max_id')
+    return _ig_authenticated(
+        scrape_reels, user_id, max_id, charge_note='Instagram reels',
+        allow_anonymous_fallback=True,
+    )
 
 
-@app.route('/api/instagram/tagged', methods=['POST'])
-@require_auth
-def instagram_tagged_endpoint():
-    from instagram_scraper import scrape_tagged
+# --- Bot accounts pool (cuentas-bot logueadas para llamadas autenticadas) ---
+BOT_REQUIRED_COOKIES = ('sessionid', 'csrftoken', 'ds_user_id')
+
+
+def _normalize_cookies(raw):
+    """Acepta:
+    - dict {name: value}
+    - lista de objetos como exporta 'EditThisCookie' / 'Cookie Editor'
+      (cada item con 'name' y 'value').
+    Devuelve dict.
+    """
+    if isinstance(raw, dict):
+        return {k: v for k, v in raw.items() if v}
+    if isinstance(raw, list):
+        out = {}
+        for item in raw:
+            if isinstance(item, dict) and item.get('name'):
+                out[item['name']] = item.get('value', '')
+        return out
+    return {}
+
+
+def _validate_cookies(cookies: dict) -> str | None:
+    """Devuelve mensaje de error si faltan cookies imprescindibles, sino None."""
+    missing = [k for k in BOT_REQUIRED_COOKIES if not cookies.get(k)]
+    if missing:
+        return f'Faltan cookies obligatorias: {", ".join(missing)}'
+    return None
+
+
+def pick_bot_account(conn=None):
+    """Devuelve la cuenta-bot active con last_used_at más antiguo (round-robin).
+    Si no hay ninguna activa, devuelve None.
+    Marca last_used_at antes de devolverla para minimizar carreras."""
+    own_conn = conn is None
+    if own_conn:
+        conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, username, cookies FROM bot_accounts WHERE status='active' "
+            'ORDER BY (last_used_at IS NULL) DESC, last_used_at ASC LIMIT 1'
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            'UPDATE bot_accounts SET last_used_at = ?, used_count = used_count + 1 WHERE id = ?',
+            (now_iso(), row['id']),
+        )
+        if own_conn:
+            conn.commit()
+        try:
+            cookies = json.loads(row['cookies'])
+        except Exception:
+            cookies = {}
+        return {'id': row['id'], 'username': row['username'], 'cookies': cookies}
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def burn_bot_account(account_id: int, reason: str):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE bot_accounts SET status='burned', burned_at=?, burn_reason=? WHERE id=?",
+            (now_iso(), reason[:300], account_id),
+        )
+        conn.commit()
+    log.warning('bot account #%s burned: %s', account_id, reason)
+
+
+@app.route('/api/admin/bot-accounts', methods=['GET'])
+@require_admin
+def admin_bot_accounts_list():
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT id, username, status, added_at, last_used_at, used_count, '
+            'burn_reason, burned_at, notes FROM bot_accounts ORDER BY id DESC'
+        ).fetchall()
+    return jsonify({'accounts': [dict(r) for r in rows]})
+
+
+@app.route('/api/admin/bot-accounts', methods=['POST'])
+@require_admin
+def admin_bot_accounts_create():
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip().lstrip('@')
     if not username:
-        return jsonify({'message': 'username inválido.'}), 400
-    return _ig_handle(scrape_tagged, username, charge_username='Instagram tagged')
+        return jsonify({'message': 'username requerido'}), 400
+    cookies = _normalize_cookies(data.get('cookies'))
+    err = _validate_cookies(cookies)
+    if err:
+        return jsonify({'message': err}), 400
+    notes = (data.get('notes') or '').strip()[:500] or None
+    try:
+        with get_db() as conn:
+            conn.execute(
+                'INSERT INTO bot_accounts (username, cookies, status, added_at, notes) '
+                "VALUES (?, ?, 'active', ?, ?)",
+                (username, json.dumps(cookies), now_iso(), notes),
+            )
+            conn.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({'message': 'Ya existe una cuenta-bot con ese username'}), 409
+    return jsonify({'ok': True, 'message': f'Cuenta-bot @{username} añadida'})
+
+
+@app.route('/api/admin/bot-accounts/<int:bid>', methods=['DELETE'])
+@require_admin
+def admin_bot_accounts_delete(bid: int):
+    with get_db() as conn:
+        cur = conn.execute('DELETE FROM bot_accounts WHERE id = ?', (bid,))
+        conn.commit()
+    if cur.rowcount == 0:
+        return jsonify({'message': 'No encontrada'}), 404
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/bot-accounts/<int:bid>/reactivate', methods=['POST'])
+@require_admin
+def admin_bot_accounts_reactivate(bid: int):
+    """Para volver a poner una burned como active sin re-añadir las cookies."""
+    data = request.get_json(silent=True) or {}
+    new_cookies = data.get('cookies')
+    with get_db() as conn:
+        if new_cookies is not None:
+            normalized = _normalize_cookies(new_cookies)
+            err = _validate_cookies(normalized)
+            if err:
+                return jsonify({'message': err}), 400
+            conn.execute(
+                "UPDATE bot_accounts SET cookies=?, status='active', burned_at=NULL, burn_reason=NULL "
+                'WHERE id=?',
+                (json.dumps(normalized), bid),
+            )
+        else:
+            conn.execute(
+                "UPDATE bot_accounts SET status='active', burned_at=NULL, burn_reason=NULL WHERE id=?",
+                (bid,),
+            )
+        conn.commit()
+    return jsonify({'ok': True})
+
+
+# --- Endpoints autenticados de Instagram (usan pool de cuentas-bot) ---
+def _ig_authenticated(scraper_fn, *args, charge_note: str, allow_anonymous_fallback: bool = False):
+    """Wrapper común para los endpoints que requieren cookie de cuenta-bot.
+
+    Comprueba saldo, escoge una cuenta-bot, ejecuta scraper. Si IG rechaza la
+    cookie (ExpiredAuth), la marca burned y reintenta hasta agotar el pool.
+    """
+    from instagram_scraper import (
+        InstagramAuthExpiredError,
+        InstagramBlockedError,
+        InstagramNotFoundError,
+        InstagramScrapeError,
+    )
+
+    user = request.user['username']
+    with get_db() as conn:
+        row = conn.execute('SELECT tokens FROM usuarios WHERE username = ?', (user,)).fetchone()
+    if not row or (row['tokens'] or 0) <= 0:
+        return jsonify({'message': 'No tienes tokens disponibles.', 'tokens_restantes': 0}), 402
+
+    last_error = None
+    tried = 0
+    while tried < 5:
+        bot = pick_bot_account()
+        if not bot:
+            if allow_anonymous_fallback:
+                # último intento sin cookie, IG puede o no responder.
+                try:
+                    result = scraper_fn(*args, cookies=None)
+                    _ok, tokens_restantes = consume_one_token(user, note=charge_note)
+                    return jsonify({'data': result, 'tokens_restantes': tokens_restantes,
+                                    'used_bot': None, 'fallback_anonymous': True})
+                except InstagramBlockedError as e:
+                    return jsonify({
+                        'message': 'No hay cuentas-bot activas y la IP del servidor está bloqueada.',
+                        'code': 'no_bots_available',
+                        'detail': str(e),
+                    }), 503
+                except InstagramNotFoundError as e:
+                    return jsonify({'message': str(e), 'code': 'not_found'}), 404
+                except InstagramScrapeError as e:
+                    return jsonify({'message': str(e), 'code': 'scrape_error'}), 502
+            return jsonify({
+                'message': 'No hay cuentas-bot activas. Pide al admin que añada una.',
+                'code': 'no_bots_available',
+            }), 503
+
+        try:
+            result = scraper_fn(*args, cookies=bot['cookies'])
+            _ok, tokens_restantes = consume_one_token(user, note=charge_note)
+            return jsonify({
+                'data': result,
+                'tokens_restantes': tokens_restantes,
+                'used_bot': bot['username'],
+            })
+        except InstagramAuthExpiredError as e:
+            burn_bot_account(bot['id'], str(e))
+            last_error = str(e)
+            tried += 1
+            continue
+        except InstagramNotFoundError as e:
+            return jsonify({'message': str(e), 'code': 'not_found'}), 404
+        except InstagramBlockedError as e:
+            last_error = str(e)
+            tried += 1
+            continue
+        except InstagramScrapeError as e:
+            return jsonify({'message': str(e), 'code': 'scrape_error'}), 502
+
+    return jsonify({
+        'message': f'Todas las cuentas-bot disponibles fallaron. Último error: {last_error}',
+        'code': 'pool_exhausted',
+    }), 503
+
+
+@app.route('/api/instagram/stories', methods=['POST'])
+@require_auth
+def instagram_stories_endpoint_v2():
+    """Reemplaza al endpoint anterior. Usa pool de cuentas-bot."""
+    from instagram_scraper import scrape_stories
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get('user_id') or '').strip()
+    if not user_id.isdigit():
+        return jsonify({'message': 'user_id inválido.'}), 400
+    return _ig_authenticated(scrape_stories, user_id, charge_note='Instagram stories')
+
+
+@app.route('/api/instagram/highlights', methods=['POST'])
+@require_auth
+def instagram_highlights_endpoint_v2():
+    from instagram_scraper import scrape_highlights
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get('user_id') or '').strip()
+    if not user_id.isdigit():
+        return jsonify({'message': 'user_id inválido.'}), 400
+    return _ig_authenticated(scrape_highlights, user_id, charge_note='Instagram highlights')
+
+
+@app.route('/api/instagram/followers', methods=['POST'])
+@require_auth
+def instagram_followers_endpoint():
+    from instagram_scraper import scrape_followers
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get('user_id') or '').strip()
+    if not user_id.isdigit():
+        return jsonify({'message': 'user_id inválido.'}), 400
+    max_id = data.get('max_id')
+    return _ig_authenticated(scrape_followers, user_id, max_id, charge_note='Instagram followers')
+
+
+@app.route('/api/instagram/following', methods=['POST'])
+@require_auth
+def instagram_following_endpoint():
+    from instagram_scraper import scrape_following
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get('user_id') or '').strip()
+    if not user_id.isdigit():
+        return jsonify({'message': 'user_id inválido.'}), 400
+    max_id = data.get('max_id')
+    return _ig_authenticated(scrape_following, user_id, max_id, charge_note='Instagram following')
 
 
 # Image proxy — gratis, evita problemas de CORS/Origin con CDN de Instagram.

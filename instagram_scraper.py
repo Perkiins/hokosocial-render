@@ -1,21 +1,15 @@
 """
-HokoSocial — Instagram public-profile scraper (server-side).
+HokoSocial — Instagram scraper (server-side).
 
-Funciona SIN login. Cada función puede fallar con InstagramBlockedError
-si la IP está marcada (típico desde datacenter); el caller decidirá si
-fallback al worker.
+Trabaja en dos modos:
+- Anónimo: solo perfil público + 12 posts. Falla con 401/403/429 si la IP
+  está marcada (típico desde Render).
+- Autenticado: con un dict `cookies` válido (de una cuenta-bot logueada),
+  desbloquea stories, highlights, followers, following, tagged, y libera el
+  bloqueo de IP de Render porque IG nos atiende como user logueado.
 
-Endpoints públicos verificados (residencial):
-- web_profile_info        → perfil base + 12 posts.
-- users/{id}/info         → info detallada.
-- feed/user/{id}          → timeline paginado (todos los posts).
-- feed/reels_media        → stories activas.
-- /{username}/ (HTML)     → highlights tray embebido.
-- /{username}/tagged/     → tagged HTML.
-
-Endpoints que NO funcionan sin login (verificado):
-- friendships/{id}/followers → 401, require_login.
-- friendships/{id}/following → 401, require_login.
+Cuando IG rechaza la cookie (login_required / challenge_required) lanza
+InstagramAuthExpiredError para que el caller marque la cuenta burned.
 """
 
 from __future__ import annotations
@@ -37,18 +31,22 @@ APP_ID = '936619743392459'
 
 
 class InstagramBlockedError(Exception):
-    pass
+    """IG bloqueó por IP / rate limit (401/403/429 sin cookie válida)."""
+
+
+class InstagramAuthExpiredError(Exception):
+    """La cookie de la cuenta-bot ya no es válida (login_required, challenge_required, checkpoint)."""
 
 
 class InstagramNotFoundError(Exception):
-    pass
+    """username inexistente."""
 
 
 class InstagramScrapeError(Exception):
-    pass
+    """Otros fallos."""
 
 
-def _headers(extra: dict | None = None) -> dict:
+def _headers(cookies: dict | None = None, extra: dict | None = None) -> dict:
     h = {
         'User-Agent': UA,
         'X-IG-App-ID': APP_ID,
@@ -60,16 +58,40 @@ def _headers(extra: dict | None = None) -> dict:
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
     }
+    if cookies and cookies.get('csrftoken'):
+        h['X-CSRFToken'] = cookies['csrftoken']
     if extra:
         h.update(extra)
     return h
 
 
-def _get(url: str, retries: int = 1, timeout: int = 12, accept_html: bool = False) -> requests.Response:
+def _cookie_jar(cookies: dict | None) -> dict | None:
+    if not cookies:
+        return None
+    # requests acepta un dict {name: value}
+    return {k: v for k, v in cookies.items() if v}
+
+
+def _detect_auth_problem(payload: dict | None) -> bool:
+    """Detecta respuesta de 'cookie quemada'."""
+    if not isinstance(payload, dict):
+        return False
+    msg = (payload.get('message') or '').lower()
+    return (
+        payload.get('require_login')
+        or payload.get('login_required')
+        or 'login_required' in msg
+        or 'checkpoint' in msg
+        or 'challenge_required' in msg
+        or 'spam' in msg
+    )
+
+
+def _get(url: str, cookies: dict | None = None, retries: int = 1, timeout: int = 12) -> requests.Response:
     last_status = None
     for attempt in range(retries + 1):
         try:
-            r = requests.get(url, headers=_headers(), timeout=timeout)
+            r = requests.get(url, headers=_headers(cookies), cookies=_cookie_jar(cookies), timeout=timeout)
         except Exception as e:
             if attempt < retries:
                 time.sleep(1.0)
@@ -77,21 +99,30 @@ def _get(url: str, retries: int = 1, timeout: int = 12, accept_html: bool = Fals
             raise InstagramScrapeError(f'Network error: {e}')
 
         last_status = r.status_code
-        if r.status_code == 200 or (accept_html and r.status_code in (200, 201)):
+        if r.status_code == 200:
             return r
         if r.status_code == 404:
             raise InstagramNotFoundError(f'404 not found at {url}')
         if r.status_code in (401, 403, 429):
+            # Si tenemos cookie y nos rechaza, posiblemente está quemada.
+            if cookies:
+                try:
+                    body = r.json()
+                except Exception:
+                    body = None
+                if _detect_auth_problem(body):
+                    raise InstagramAuthExpiredError(
+                        f'Cookie inválida o quemada (HTTP {r.status_code}: {body or r.text[:120]})'
+                    )
             raise InstagramBlockedError(f'HTTP {r.status_code} (login or rate-limit)')
         if attempt < retries:
             time.sleep(1.0)
     raise InstagramScrapeError(f'HTTP {last_status} after retries')
 
 
-# ---------- Profile (base) ----------
+# ---------- Profile (web_profile_info) ----------
 
 def _post_summary(node: dict) -> dict:
-    """De edge_owner_to_timeline_media (web_profile_info)."""
     return {
         'shortcode': node.get('shortcode'),
         'thumbnail': node.get('thumbnail_src') or node.get('display_url'),
@@ -110,7 +141,6 @@ def _post_summary(node: dict) -> dict:
 
 
 def _feed_item(item: dict) -> dict:
-    """De feed/user/{id} (estructura distinta)."""
     image_versions = (item.get('image_versions2') or {}).get('candidates') or []
     thumb = image_versions[0]['url'] if image_versions else None
     if not thumb and item.get('carousel_media'):
@@ -124,7 +154,7 @@ def _feed_item(item: dict) -> dict:
         'thumbnail': thumb,
         'is_video': media_type == 2,
         'is_carousel': media_type == 8,
-        'product_type': item.get('product_type'),  # 'clips' = reel
+        'product_type': item.get('product_type'),
         'caption': ((item.get('caption') or {}).get('text') or '')[:280],
         'likes': item.get('like_count', 0),
         'comments': item.get('comment_count', 0),
@@ -133,10 +163,21 @@ def _feed_item(item: dict) -> dict:
     }
 
 
+def _user_summary(u: dict) -> dict:
+    return {
+        'username': u.get('username'),
+        'full_name': u.get('full_name'),
+        'profile_pic_url': u.get('profile_pic_url'),
+        'is_verified': bool(u.get('is_verified')),
+        'is_private': bool(u.get('is_private')),
+        'pk': u.get('pk') or u.get('id'),
+    }
+
+
 def parse_user(data: dict) -> dict:
     user = (data.get('data') or {}).get('user')
     if not user:
-        raise InstagramScrapeError('Estructura de respuesta inesperada.')
+        raise InstagramScrapeError('Estructura inesperada en web_profile_info.')
 
     posts_edges = ((user.get('edge_owner_to_timeline_media') or {}).get('edges') or [])
     recent_posts = [_post_summary(e.get('node') or {}) for e in posts_edges[:12]]
@@ -161,26 +202,25 @@ def parse_user(data: dict) -> dict:
     }
 
 
-def scrape_profile(username: str) -> dict:
+def scrape_profile(username: str, cookies: dict | None = None) -> dict:
     username = (username or '').strip().lstrip('@').lower()
     if not username:
         raise InstagramScrapeError('Username vacío.')
     url = f'https://www.instagram.com/api/v1/users/web_profile_info/?username={username}'
-    r = _get(url)
+    r = _get(url, cookies=cookies)
     try:
         return parse_user(r.json())
     except ValueError:
         raise InstagramScrapeError('Respuesta no-JSON.')
 
 
-# ---------- Feed completo (timeline) paginado ----------
+# ---------- Feed (timeline) ----------
 
-def scrape_feed(user_id: str, max_id: str | None = None, count: int = 12) -> dict:
-    """Devuelve {items: [...], next_max_id: str|None, more_available: bool}."""
+def scrape_feed(user_id: str, max_id: str | None = None, count: int = 12, cookies: dict | None = None) -> dict:
     base = f'https://i.instagram.com/api/v1/feed/user/{user_id}/?count={count}'
     if max_id:
         base += f'&max_id={max_id}'
-    r = _get(base)
+    r = _get(base, cookies=cookies)
     data = r.json()
     items = data.get('items') or []
     return {
@@ -190,12 +230,30 @@ def scrape_feed(user_id: str, max_id: str | None = None, count: int = 12) -> dic
     }
 
 
-# ---------- Stories ----------
+# ---------- Reels (subset del feed) ----------
 
-def scrape_stories(user_id: str) -> dict:
-    """Stories activas. Si no tiene, devuelve items vacío."""
+def scrape_reels(user_id: str, max_id: str | None = None, count: int = 12, cookies: dict | None = None) -> dict:
+    base = f'https://i.instagram.com/api/v1/feed/user/{user_id}/?count={count * 2}'
+    if max_id:
+        base += f'&max_id={max_id}'
+    r = _get(base, cookies=cookies)
+    data = r.json()
+    items = data.get('items') or []
+    reels_only = [_feed_item(it) for it in items if (it.get('product_type') == 'clips')]
+    return {
+        'items': reels_only[:count],
+        'next_max_id': data.get('next_max_id'),
+        'more_available': bool(data.get('more_available')),
+    }
+
+
+# ---------- Stories (requiere cookie) ----------
+
+def scrape_stories(user_id: str, cookies: dict) -> dict:
+    if not cookies:
+        raise InstagramScrapeError('Stories requiere cookies de cuenta-bot.')
     url = f'https://i.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}'
-    r = _get(url)
+    r = _get(url, cookies=cookies)
     data = r.json()
     reels = data.get('reels') or {}
     reel = reels.get(str(user_id)) or {}
@@ -221,83 +279,66 @@ def scrape_stories(user_id: str) -> dict:
     }
 
 
-# ---------- Highlights (parseando la página HTML del perfil) ----------
+# ---------- Highlights (requiere cookie) ----------
 
-_HIGHLIGHTS_RE = re.compile(
-    r'"highlight_reels":\s*(\[.*?\])',
-    re.DOTALL,
-)
-
-
-def scrape_highlights(username: str) -> dict:
-    """Highlights tray: solo metadatos (id, title, cover_url). Cubre la página
-    pública que ya hace SSR con datos embebidos. Si no tiene highlights, list
-    vacío.
-
-    El endpoint JSON propio de highlights requiere login; este truco usa el
-    HTML público que sí los lista.
-    """
-    url = f'https://www.instagram.com/{username}/'
-    r = _get(url, accept_html=True)
-    html = r.text
+def scrape_highlights(user_id: str, cookies: dict) -> dict:
+    if not cookies:
+        raise InstagramScrapeError('Highlights requiere cookies de cuenta-bot.')
+    url = f'https://i.instagram.com/api/v1/highlights/{user_id}/highlights_tray/'
+    r = _get(url, cookies=cookies)
+    data = r.json()
+    tray = data.get('tray') or []
     items = []
-    # Forma 1: GraphQL embebido (Instagram pre-rendera SOMETIMES)
-    m = _HIGHLIGHTS_RE.search(html)
-    if m:
-        try:
-            arr = json.loads(m.group(1))
-            for h in arr:
-                items.append({
-                    'id': h.get('id'),
-                    'title': h.get('title'),
-                    'cover_url': (h.get('cover_media') or {}).get('thumbnail_src') or h.get('cover_media_cropped_thumbnail') or None,
-                })
-        except Exception:
-            pass
-
-    # Forma 2: el endpoint de la versión web también expone tray a través de
-    # un GraphQL POST que requiere doc_id. Como muchas veces el HTML no embebe,
-    # devolvemos lo que tengamos. Si está vacío, el frontend muestra "no hay".
-    return {
-        'items': items,
-        'count': len(items),
-        'note': 'Si no se ven highlights, Instagram puede haber cambiado el SSR. '
-                'En ese caso solo se obtendrían con login.',
-    }
+    for h in tray:
+        cover = h.get('cover_media') or {}
+        thumb_versions = (cover.get('cropped_image_version') or {})
+        items.append({
+            'id': h.get('id'),
+            'title': h.get('title'),
+            'cover_url': thumb_versions.get('url') or (h.get('cover_media') or {}).get('url'),
+            'media_count': h.get('media_count'),
+            'created_at': h.get('created_at'),
+        })
+    return {'items': items, 'count': len(items)}
 
 
-# ---------- Tagged (etiquetadas) ----------
+# ---------- Followers / Following (requieren cookie) ----------
 
-def scrape_tagged(username: str, count: int = 12) -> dict:
-    """Tagged feed: parsea la página HTML pública /{username}/tagged/."""
-    url = f'https://www.instagram.com/{username}/tagged/'
-    r = _get(url, accept_html=True)
-    # El feed embebido va en application/json scripts. Implementación mínima:
-    # solo confirmamos disponibilidad. El parsing fino requiere doc_id y queda
-    # para iteración futura.
-    has = '"tagged"' in r.text or 'usertags' in r.text
-    return {
-        'items': [],
-        'available': has,
-        'note': 'Etiquetadas requieren un GraphQL adicional con doc_id. '
-                'En esta versión solo confirmamos que la página existe.',
-    }
-
-
-# ---------- Reels (subset del feed) ----------
-
-def scrape_reels(user_id: str, max_id: str | None = None, count: int = 12) -> dict:
-    """No hay endpoint público sólo para reels que funcione sin login.
-    Como workaround, recorremos el feed y filtramos product_type='clips'."""
-    base = f'https://i.instagram.com/api/v1/feed/user/{user_id}/?count={count * 2}'
+def _friendship_list(user_id: str, cookies: dict, kind: str, max_id: str | None = None, count: int = 24) -> dict:
+    if not cookies:
+        raise InstagramScrapeError(f'{kind.capitalize()} requiere cookies de cuenta-bot.')
+    base = f'https://i.instagram.com/api/v1/friendships/{user_id}/{kind}/?count={count}'
     if max_id:
         base += f'&max_id={max_id}'
-    r = _get(base)
+    r = _get(base, cookies=cookies)
     data = r.json()
-    items = data.get('items') or []
-    reels_only = [_feed_item(it) for it in items if (it.get('product_type') == 'clips')]
+    users_raw = data.get('users') or []
     return {
-        'items': reels_only[:count],
+        'items': [_user_summary(u) for u in users_raw],
         'next_max_id': data.get('next_max_id'),
-        'more_available': bool(data.get('more_available')),
+        'has_more': bool(data.get('big_list')) or bool(data.get('next_max_id')),
+        'total_count': data.get('total_count'),
+    }
+
+
+def scrape_followers(user_id: str, cookies: dict, max_id: str | None = None, count: int = 24) -> dict:
+    return _friendship_list(user_id, cookies, 'followers', max_id, count)
+
+
+def scrape_following(user_id: str, cookies: dict, max_id: str | None = None, count: int = 24) -> dict:
+    return _friendship_list(user_id, cookies, 'following', max_id, count)
+
+
+# ---------- User info detallado (con cookie da has_active_story etc) ----------
+
+def scrape_user_info(user_id: str, cookies: dict | None = None) -> dict:
+    """Devuelve flags útiles: has_active_story, story_count, etc."""
+    url = f'https://i.instagram.com/api/v1/users/{user_id}/info/'
+    r = _get(url, cookies=cookies)
+    data = r.json()
+    user = data.get('user') or {}
+    return {
+        'has_active_story': bool(user.get('has_active_story') or user.get('story_count')),
+        'story_count': user.get('story_count', 0),
+        'highlight_reel_count': user.get('highlight_reel_count', 0),
     }
