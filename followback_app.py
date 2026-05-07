@@ -78,7 +78,10 @@ log = logging.getLogger('hokosocial')
 
 # --- DB ---
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    # check_same_thread=False permite al orchestrator (thread daemon) abrir
+    # conexiones desde otro hilo. Cada llamada crea su propia conexión, así
+    # que no hay conflicto de uso compartido — solo desactivamos el guard.
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -2400,6 +2403,10 @@ def ig_growth_dashboard():
             'converted': converted,
         },
         'next_task': dict(next_task) if next_task else None,
+        'orchestrator': {
+            'disabled_by_env': os.environ.get('GROWTH_ORCHESTRATOR_DISABLED', '').lower() == 'true',
+            'thread_started': _orchestrator_started,
+        },
     })
 
 
@@ -2610,10 +2617,20 @@ _orchestrator_lock = threading.Lock()
 
 
 def _orchestrator_loop():
+    # Espera inicial: deja que init_db termine, que gunicorn esté servido y
+    # que el primer health-check pase. Si arrancamos a los 0s podemos
+    # competir con peticiones HTTP por el SQLite y dar 500 en /api/* hasta
+    # que el server estabiliza.
+    time.sleep(30)
     log.info('Growth orchestrator started (pid=%d)', os.getpid())
     while True:
         try:
             _orchestrator_tick()
+        except sqlite3.OperationalError as e:
+            # No-op gracefully si el schema todavía no está completo
+            # (caso típico al primer arranque antes de init_db terminar) o
+            # si la DB está bloqueada. Los siguientes ticks reintentarán.
+            log.warning('orchestrator tick: SQLite operational: %s', e)
         except Exception:
             log.exception('orchestrator loop crashed (continuing)')
         time.sleep(60)
@@ -2628,8 +2645,16 @@ def start_orchestrator():
         if _orchestrator_started:
             return
         _orchestrator_started = True
-        t = threading.Thread(target=_orchestrator_loop, daemon=True, name='growth-orchestrator')
-        t.start()
+        try:
+            t = threading.Thread(
+                target=_orchestrator_loop, daemon=True,
+                name='growth-orchestrator',
+            )
+            t.start()
+        except Exception:
+            # Nunca debe matar el arranque del web server.
+            log.exception('No se pudo arrancar el orchestrator (continuando sin él)')
+            _orchestrator_started = False
 
 
 # --- Digital Footprint ---
