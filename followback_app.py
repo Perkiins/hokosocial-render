@@ -47,8 +47,9 @@ CORS(app, origins=cors_origins, supports_credentials=True)
 
 DB_PATH = os.environ.get('DB_PATH', 'usuarios.db')
 
-TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile', 'ig_snapshot')
+TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile', 'ig_snapshot', 'footprint_scan')
 WORKER_TYPES = ('search', 'followback', 'instagram_profile', 'ig_snapshot')
+# `footprint_scan` corre en el propio backend (thread), no requiere worker en PC.
 MAX_LOG_LINES = 2000
 WORKER_OFFLINE_AFTER = 30
 ZOMBIE_TASK_AFTER = 300  # 5 min sin update => zombie, se auto-failea
@@ -177,6 +178,22 @@ def init_db():
         )''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_snap_owner '
                      'ON ig_snapshots (owner, ig_username, taken_at)')
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS footprint_scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            email_hash TEXT,
+            phone_hash TEXT,
+            email_masked TEXT,
+            phone_masked TEXT,
+            face_used INTEGER NOT NULL DEFAULT 0,
+            score INTEGER,
+            result_json TEXT NOT NULL,
+            task_id INTEGER
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_footprint_owner '
+                     'ON footprint_scans (owner, created_at)')
 
         conn.execute('''CREATE TABLE IF NOT EXISTS bot_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -390,23 +407,32 @@ def credit_tokens(username: str, amount: int, kind: str, note: str | None = None
     return True, balance
 
 
-def consume_one_token(username: str, note: str | None = None) -> tuple[bool, int]:
-    """Decrementa 1 token + crea transaction kind='consume'. Atómico."""
+def consume_n_tokens(username: str, n: int, note: str | None = None) -> tuple[bool, int]:
+    """Decrementa N tokens + crea transaction kind='consume'. Atómico."""
+    if n <= 0:
+        with get_db() as conn:
+            row = conn.execute('SELECT tokens FROM usuarios WHERE username = ?', (username,)).fetchone()
+        return True, (row['tokens'] if row else 0)
     with get_db() as conn:
         cur = conn.execute(
-            'UPDATE usuarios SET tokens = tokens - 1 WHERE username = ? AND tokens > 0',
-            (username,),
+            'UPDATE usuarios SET tokens = tokens - ? WHERE username = ? AND tokens >= ?',
+            (n, username, n),
         )
         row = conn.execute(
             'SELECT tokens FROM usuarios WHERE username = ?', (username,)
         ).fetchone()
         balance = row['tokens'] if row else 0
         if cur.rowcount > 0:
-            add_transaction(conn, username, 'consume', -1, balance, note=note)
+            add_transaction(conn, username, 'consume', -n, balance, note=note)
             conn.commit()
             return True, balance
         conn.commit()
     return False, balance
+
+
+def consume_one_token(username: str, note: str | None = None) -> tuple[bool, int]:
+    """Compat — usa consume_n_tokens(1)."""
+    return consume_n_tokens(username, 1, note)
 
 
 # --- Auth endpoints ---
@@ -696,6 +722,65 @@ def run_simulation(task_id: int):
             conn.commit()
 
 
+def run_footprint_scan(task_id: int, owner: str, payload: dict):
+    """Corre digital_footprint.run_full_scan en un thread y persiste el resultado."""
+    from digital_footprint import run_full_scan
+
+    def push(line: str):
+        append_log_lines(task_id, [line])
+
+    try:
+        result = run_full_scan(
+            email=payload.get('email'),
+            phone=payload.get('phone'),
+            image_data_b64=payload.get('image_b64'),
+            log_fn=push,
+        )
+    except ValueError as e:
+        push(f'❌ {e}')
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE tasks SET status='failed', error=?, finished_at=? WHERE id=?",
+                (str(e), now_iso(), task_id),
+            )
+            conn.commit()
+        return
+    except Exception as e:
+        log.exception('footprint scan failed for task %s', task_id)
+        push(f'❌ Error interno: {e}')
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE tasks SET status='failed', error=?, finished_at=? WHERE id=?",
+                (str(e)[:500], now_iso(), task_id),
+            )
+            conn.commit()
+        return
+
+    # Persistir en footprint_scans + actualizar tasks.result
+    serialized = json.dumps(result)
+    with get_db() as conn:
+        conn.execute(
+            'INSERT INTO footprint_scans '
+            '(owner, created_at, email_hash, phone_hash, email_masked, phone_masked, '
+            ' face_used, score, result_json, task_id) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                owner, now_iso(),
+                result.get('email_hash'), result.get('phone_hash'),
+                result.get('email_masked'), result.get('phone_masked'),
+                1 if result.get('face_used') else 0,
+                int(result.get('score') or 0),
+                serialized, task_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET result=?, status='done', finished_at=? WHERE id=?",
+            (serialized, now_iso(), task_id),
+        )
+        conn.commit()
+    push(f'🎉 Scan completado. Score de exposición: {result.get("score")}/100')
+
+
 # --- Bot endpoints de usuario ---
 @app.route('/api/tasks', methods=['POST'])
 @require_auth
@@ -734,13 +819,37 @@ def create_task():
         if ig_user and not ig_user.replace('.', '').replace('_', '').isalnum():
             return jsonify({'message': 'username de Instagram inválido.'}), 400
         payload = {'username': ig_user} if ig_user else {}
+    elif task_type == 'footprint_scan':
+        p = payload or {}
+        email = (p.get('email') or '').strip().lower()
+        phone = (p.get('phone') or '').strip()
+        image_b64 = p.get('image_b64')
+        consent = bool(p.get('self_consent'))
+        if not consent:
+            return jsonify({
+                'message': 'Tienes que confirmar que estos datos son tuyos (self_consent=true).',
+            }), 400
+        if not (email or phone or image_b64):
+            return jsonify({'message': 'Pásanos al menos un email, teléfono o foto.'}), 400
+        if email and '@' not in email:
+            return jsonify({'message': 'Email inválido.'}), 400
+        if image_b64 and not isinstance(image_b64, str):
+            return jsonify({'message': 'image_b64 debe ser string base64.'}), 400
+        payload = {
+            'email': email or None,
+            'phone': phone or None,
+            'image_b64': image_b64 or None,
+            'self_consent': True,
+        }
 
     username = request.user['username']
-    ok, tokens_restantes = consume_one_token(username, note=f'Tarea {task_type}')
+    cost = _task_token_cost(task_type, payload)
+    ok, tokens_restantes = consume_n_tokens(username, cost, note=f'Tarea {task_type} ({cost}t)')
     if not ok:
         return jsonify({
-            'message': 'No tienes tokens disponibles',
+            'message': f'Necesitas {cost} token{"s" if cost != 1 else ""} para esta tarea',
             'tokens_restantes': tokens_restantes,
+            'cost': cost,
         }), 402
 
     payload_json = json.dumps(payload) if payload is not None else None
@@ -753,7 +862,7 @@ def create_task():
         conn.commit()
         task_id = cur.lastrowid
 
-    log.info('queued task %s type=%s for %s', task_id, task_type, username)
+    log.info('queued task %s type=%s for %s (cost=%d)', task_id, task_type, username, cost)
 
     if task_type == 'simulate':
         with get_db() as conn:
@@ -763,14 +872,31 @@ def create_task():
             )
             conn.commit()
         threading.Thread(target=run_simulation, args=(task_id,), daemon=True).start()
+    elif task_type == 'footprint_scan':
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE tasks SET status='running', started_at=? WHERE id=?",
+                (now_iso(), task_id),
+            )
+            conn.commit()
+        threading.Thread(target=run_footprint_scan, args=(task_id, username, payload), daemon=True).start()
 
+    immediately_running = task_type in ('simulate', 'footprint_scan')
     return jsonify({
         'id': task_id,
         'type': task_type,
-        'status': 'running' if task_type == 'simulate' else 'queued',
+        'status': 'running' if immediately_running else 'queued',
         'tokens_restantes': tokens_restantes,
-        'message': 'Tarea encolada.' if task_type != 'simulate' else 'Simulación lanzada.',
+        'cost': cost,
+        'message': 'Tarea encolada.' if not immediately_running else 'Tarea lanzada.',
     }), 201
+
+
+def _task_token_cost(task_type: str, payload: dict | None) -> int:
+    """Coste en tokens. footprint_scan con foto cuesta 2 (FaceCheck consume API)."""
+    if task_type == 'footprint_scan' and isinstance(payload, dict) and payload.get('image_b64'):
+        return 2
+    return 1
 
 
 @app.route('/api/tasks/<int:task_id>', methods=['GET'])
@@ -1658,6 +1784,86 @@ def worker_status_endpoint():
         'last_seen': last_seen_str,
         'current_task_id': row['current_task_id'],
     })
+
+
+# --- Digital Footprint ---
+@app.route('/api/footprint/latest', methods=['GET'])
+@require_auth
+def footprint_latest():
+    """Último scan del owner."""
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT id, created_at, email_masked, phone_masked, face_used, score, result_json, task_id '
+            'FROM footprint_scans WHERE owner = ? ORDER BY created_at DESC LIMIT 1',
+            (request.user['username'],),
+        ).fetchone()
+    if not row:
+        return jsonify({'scan': None})
+    try:
+        result = json.loads(row['result_json']) if row['result_json'] else {}
+    except Exception:
+        result = {}
+    return jsonify({'scan': {
+        'id': row['id'],
+        'created_at': row['created_at'],
+        'email_masked': row['email_masked'],
+        'phone_masked': row['phone_masked'],
+        'face_used': bool(row['face_used']),
+        'score': row['score'],
+        'result': result,
+        'task_id': row['task_id'],
+    }})
+
+
+@app.route('/api/footprint/history', methods=['GET'])
+@require_auth
+def footprint_history():
+    """Histórico de scans del owner (sin el JSON completo, solo metadatos)."""
+    try:
+        limit = max(1, min(int(request.args.get('limit', 30)), 200))
+    except ValueError:
+        limit = 30
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT id, created_at, email_masked, phone_masked, face_used, score, task_id '
+            'FROM footprint_scans WHERE owner = ? ORDER BY created_at DESC LIMIT ?',
+            (request.user['username'], limit),
+        ).fetchall()
+    return jsonify({'history': [{
+        'id': r['id'],
+        'created_at': r['created_at'],
+        'email_masked': r['email_masked'],
+        'phone_masked': r['phone_masked'],
+        'face_used': bool(r['face_used']),
+        'score': r['score'],
+        'task_id': r['task_id'],
+    } for r in rows]})
+
+
+@app.route('/api/footprint/scan/<int:scan_id>', methods=['GET'])
+@require_auth
+def footprint_get(scan_id):
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT * FROM footprint_scans WHERE id = ? AND owner = ?',
+            (scan_id, request.user['username']),
+        ).fetchone()
+    if not row:
+        return jsonify({'message': 'No encontrado'}), 404
+    try:
+        result = json.loads(row['result_json']) if row['result_json'] else {}
+    except Exception:
+        result = {}
+    return jsonify({'scan': {
+        'id': row['id'],
+        'created_at': row['created_at'],
+        'email_masked': row['email_masked'],
+        'phone_masked': row['phone_masked'],
+        'face_used': bool(row['face_used']),
+        'score': row['score'],
+        'result': result,
+        'task_id': row['task_id'],
+    }})
 
 
 # --- Admin ---
