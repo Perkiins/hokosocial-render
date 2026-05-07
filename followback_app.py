@@ -47,8 +47,8 @@ CORS(app, origins=cors_origins, supports_credentials=True)
 
 DB_PATH = os.environ.get('DB_PATH', 'usuarios.db')
 
-TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile')
-WORKER_TYPES = ('search', 'followback', 'instagram_profile')
+TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile', 'ig_snapshot')
+WORKER_TYPES = ('search', 'followback', 'instagram_profile', 'ig_snapshot')
 MAX_LOG_LINES = 2000
 WORKER_OFFLINE_AFTER = 30
 ZOMBIE_TASK_AFTER = 300  # 5 min sin update => zombie, se auto-failea
@@ -159,6 +159,24 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_tx_owner ON transactions (owner, created_at)')
         conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_stripe ON transactions (stripe_session_id) '
                      "WHERE stripe_session_id IS NOT NULL")
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS ig_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            ig_username TEXT NOT NULL,
+            taken_at TEXT NOT NULL,
+            followers_count INTEGER NOT NULL DEFAULT 0,
+            following_count INTEGER NOT NULL DEFAULT 0,
+            mutuals_count INTEGER NOT NULL DEFAULT 0,
+            not_following_back_count INTEGER NOT NULL DEFAULT 0,
+            fans_count INTEGER NOT NULL DEFAULT 0,
+            profile_json TEXT,
+            followers_json TEXT,
+            following_json TEXT,
+            task_id INTEGER
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_snap_owner '
+                     'ON ig_snapshots (owner, ig_username, taken_at)')
 
         conn.execute('''CREATE TABLE IF NOT EXISTS bot_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -711,6 +729,11 @@ def create_task():
             payload = {'action': action, 'username': ig_user}
         else:
             return jsonify({'message': f'action no soportada: {action}'}), 400
+    elif task_type == 'ig_snapshot':
+        ig_user = ((payload or {}).get('username') or '').strip().lstrip('@')
+        if ig_user and not ig_user.replace('.', '').replace('_', '').isalnum():
+            return jsonify({'message': 'username de Instagram inválido.'}), 400
+        payload = {'username': ig_user} if ig_user else {}
 
     username = request.user['username']
     ok, tokens_restantes = consume_one_token(username, note=f'Tarea {task_type}')
@@ -1211,6 +1234,205 @@ def instagram_following_endpoint():
     return _ig_authenticated(scrape_following, user_id, max_id, charge_note='Instagram following')
 
 
+# --- Instagram analyzer (snapshots de followers/following) ---
+def _by_pk(users):
+    return {u.get('pk'): u for u in (users or []) if isinstance(u, dict) and u.get('pk')}
+
+
+def _sort_users(users):
+    return sorted(users, key=lambda u: (u.get('username') or '').lower())
+
+
+def _ig_snapshot_row_to_dict(row, include_lists: bool = False):
+    out = {
+        'id': row['id'],
+        'ig_username': row['ig_username'],
+        'taken_at': row['taken_at'],
+        'counts': {
+            'followers': row['followers_count'],
+            'following': row['following_count'],
+            'mutuals': row['mutuals_count'],
+            'not_following_back': row['not_following_back_count'],
+            'fans': row['fans_count'],
+        },
+        'profile': json.loads(row['profile_json'] or '{}'),
+        'task_id': row['task_id'],
+    }
+    if include_lists:
+        out['followers'] = json.loads(row['followers_json'] or '[]')
+        out['following'] = json.loads(row['following_json'] or '[]')
+    return out
+
+
+def _resolve_target_username(req, user) -> str | None:
+    """Toma ?username=X o, si no viene, el del propio user (no aplicable aquí
+    porque el snapshot es de la cuenta IG, no del user de hokosocial).
+
+    Devuelve None si no es válido. Actualmente requiere que el frontend pase
+    el username explícitamente.
+    """
+    raw = (req.args.get('username') or '').strip().lstrip('@').lower()
+    if not raw or not raw.replace('.', '').replace('_', '').isalnum():
+        return None
+    return raw
+
+
+@app.route('/api/instagram/snapshot/latest', methods=['GET'])
+@require_auth
+def ig_snapshot_latest():
+    """Devuelve el último snapshot guardado del usuario para una cuenta IG.
+
+    Query: ?username=<ig_username>&include_lists=1 (opcional, gratis).
+    """
+    target = _resolve_target_username(request, request.user)
+    if not target:
+        return jsonify({'message': 'username inválido o ausente.'}), 400
+    include_lists = request.args.get('include_lists') in ('1', 'true', 'yes')
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT * FROM ig_snapshots WHERE owner = ? AND ig_username = ? '
+            'ORDER BY taken_at DESC LIMIT 1',
+            (request.user['username'], target),
+        ).fetchone()
+    if not row:
+        return jsonify({'snapshot': None}), 200
+    return jsonify({'snapshot': _ig_snapshot_row_to_dict(row, include_lists=include_lists)})
+
+
+@app.route('/api/instagram/snapshot/status', methods=['GET'])
+@require_auth
+def ig_snapshot_status():
+    """Cruces calculables con UN solo snapshot: not_following_back, fans, mutuals.
+
+    Query: ?username=<ig_username>&limit=200 (default 200, max 5000).
+    """
+    target = _resolve_target_username(request, request.user)
+    if not target:
+        return jsonify({'message': 'username inválido o ausente.'}), 400
+    try:
+        limit = max(1, min(int(request.args.get('limit', 200)), 5000))
+    except ValueError:
+        limit = 200
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT * FROM ig_snapshots WHERE owner = ? AND ig_username = ? '
+            'ORDER BY taken_at DESC LIMIT 1',
+            (request.user['username'], target),
+        ).fetchone()
+    if not row:
+        return jsonify({'status': None}), 200
+    followers = json.loads(row['followers_json'] or '[]')
+    following = json.loads(row['following_json'] or '[]')
+    f_map = _by_pk(followers)
+    g_map = _by_pk(following)
+    not_back = _sort_users([g_map[pk] for pk in g_map.keys() - f_map.keys()])
+    fans = _sort_users([f_map[pk] for pk in f_map.keys() - g_map.keys()])
+    mutuals = _sort_users([f_map[pk] for pk in f_map.keys() & g_map.keys()])
+    return jsonify({
+        'status': {
+            'ig_username': row['ig_username'],
+            'taken_at': row['taken_at'],
+            'profile': json.loads(row['profile_json'] or '{}'),
+            'counts': {
+                'followers': len(followers),
+                'following': len(following),
+                'mutuals': len(mutuals),
+                'not_following_back': len(not_back),
+                'fans': len(fans),
+            },
+            'not_following_back': not_back[:limit],
+            'fans': fans[:limit],
+        }
+    })
+
+
+@app.route('/api/instagram/snapshot/diff', methods=['GET'])
+@require_auth
+def ig_snapshot_diff():
+    """Diff entre los DOS últimos snapshots del owner para una cuenta IG.
+
+    Query: ?username=<ig_username>&limit=500.
+    """
+    target = _resolve_target_username(request, request.user)
+    if not target:
+        return jsonify({'message': 'username inválido o ausente.'}), 400
+    try:
+        limit = max(1, min(int(request.args.get('limit', 500)), 5000))
+    except ValueError:
+        limit = 500
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT * FROM ig_snapshots WHERE owner = ? AND ig_username = ? '
+            'ORDER BY taken_at DESC LIMIT 2',
+            (request.user['username'], target),
+        ).fetchall()
+    if len(rows) < 2:
+        return jsonify({'diff': None, 'snapshots_available': len(rows)}), 200
+    curr, prev = rows[0], rows[1]
+    p_followers = _by_pk(json.loads(prev['followers_json'] or '[]'))
+    c_followers = _by_pk(json.loads(curr['followers_json'] or '[]'))
+    p_following = _by_pk(json.loads(prev['following_json'] or '[]'))
+    c_following = _by_pk(json.loads(curr['following_json'] or '[]'))
+    lost = _sort_users([c_followers.get(pk) or p_followers[pk] for pk in p_followers.keys() - c_followers.keys()])
+    new_f = _sort_users([c_followers[pk] for pk in c_followers.keys() - p_followers.keys()])
+    stopped = _sort_users([p_following[pk] for pk in p_following.keys() - c_following.keys()])
+    started = _sort_users([c_following[pk] for pk in c_following.keys() - p_following.keys()])
+    return jsonify({
+        'diff': {
+            'ig_username': curr['ig_username'],
+            'taken_at': curr['taken_at'],
+            'previous_at': prev['taken_at'],
+            'follower_counts': {
+                'prev': prev['followers_count'],
+                'curr': curr['followers_count'],
+                'delta': curr['followers_count'] - prev['followers_count'],
+            },
+            'following_counts': {
+                'prev': prev['following_count'],
+                'curr': curr['following_count'],
+                'delta': curr['following_count'] - prev['following_count'],
+            },
+            'lost_followers': lost[:limit],
+            'new_followers': new_f[:limit],
+            'stopped_following': stopped[:limit],
+            'started_following': started[:limit],
+        }
+    })
+
+
+@app.route('/api/instagram/snapshot/history', methods=['GET'])
+@require_auth
+def ig_snapshot_history():
+    """Histórico de counts (sin listas) para gráfica.
+
+    Query: ?username=<ig_username>&limit=60 (default 60, max 365).
+    """
+    target = _resolve_target_username(request, request.user)
+    if not target:
+        return jsonify({'message': 'username inválido o ausente.'}), 400
+    try:
+        limit = max(1, min(int(request.args.get('limit', 60)), 365))
+    except ValueError:
+        limit = 60
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT id, taken_at, followers_count, following_count, mutuals_count, '
+            'not_following_back_count, fans_count FROM ig_snapshots '
+            'WHERE owner = ? AND ig_username = ? ORDER BY taken_at DESC LIMIT ?',
+            (request.user['username'], target, limit),
+        ).fetchall()
+    items = [{
+        'id': r['id'],
+        'taken_at': r['taken_at'],
+        'followers': r['followers_count'],
+        'following': r['following_count'],
+        'mutuals': r['mutuals_count'],
+        'not_following_back': r['not_following_back_count'],
+        'fans': r['fans_count'],
+    } for r in rows]
+    return jsonify({'history': list(reversed(items))})
+
+
 # Image proxy — gratis, evita problemas de CORS/Origin con CDN de Instagram.
 @app.route('/api/instagram/image', methods=['GET'])
 def instagram_image_proxy():
@@ -1328,7 +1550,11 @@ def worker_log(task_id):
 @app.route('/api/worker/<int:task_id>/result', methods=['POST'])
 @require_worker
 def worker_result(task_id):
-    """El worker guarda un dict de resultado estructurado (ej. perfil Instagram)."""
+    """El worker guarda un dict de resultado estructurado (ej. perfil Instagram).
+
+    Si la tarea es `ig_snapshot`, además persiste el snapshot completo en la
+    tabla `ig_snapshots` para queries históricas (último estado, diff, etc.).
+    """
     data = request.get_json(silent=True) or {}
     result = data.get('result')
     if result is None:
@@ -1338,12 +1564,51 @@ def worker_result(task_id):
     except Exception:
         return jsonify({'message': 'result no serializable a JSON'}), 400
     with get_db() as conn:
+        task_row = conn.execute('SELECT type, owner FROM tasks WHERE id = ?', (task_id,)).fetchone()
+        if not task_row:
+            return jsonify({'message': 'Tarea no encontrada'}), 404
         cur = conn.execute('UPDATE tasks SET result = ? WHERE id = ?', (serialized, task_id))
         conn.execute('UPDATE worker_status SET last_seen = ? WHERE id = 1', (now_iso(),))
+        if task_row['type'] == 'ig_snapshot' and isinstance(result, dict):
+            try:
+                _persist_ig_snapshot(conn, task_id, task_row['owner'], result)
+            except Exception:
+                log.exception('No se pudo persistir ig_snapshot del task %s', task_id)
         conn.commit()
     if cur.rowcount == 0:
         return jsonify({'message': 'Tarea no encontrada'}), 404
     return jsonify({'ok': True})
+
+
+def _persist_ig_snapshot(conn, task_id: int, owner: str, result: dict) -> None:
+    """Guarda un snapshot de followers/following en la tabla ig_snapshots."""
+    ig_user = (result.get('username') or '').strip().lstrip('@').lower()
+    if not ig_user:
+        return
+    followers = result.get('followers') or []
+    following = result.get('following') or []
+    if not isinstance(followers, list) or not isinstance(following, list):
+        return
+    f_pks = {u.get('pk') for u in followers if isinstance(u, dict) and u.get('pk')}
+    g_pks = {u.get('pk') for u in following if isinstance(u, dict) and u.get('pk')}
+    mutuals = f_pks & g_pks
+    not_back = g_pks - f_pks
+    fans = f_pks - g_pks
+    conn.execute(
+        'INSERT INTO ig_snapshots (owner, ig_username, taken_at, '
+        'followers_count, following_count, mutuals_count, '
+        'not_following_back_count, fans_count, '
+        'profile_json, followers_json, following_json, task_id) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (
+            owner, ig_user, result.get('taken_at') or now_iso(),
+            len(followers), len(following), len(mutuals), len(not_back), len(fans),
+            json.dumps(result.get('profile') or {}),
+            json.dumps(followers),
+            json.dumps(following),
+            task_id,
+        ),
+    )
 
 
 @app.route('/api/worker/<int:task_id>/finish', methods=['POST'])
