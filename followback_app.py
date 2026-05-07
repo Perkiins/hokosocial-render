@@ -2417,6 +2417,63 @@ def ig_growth_dashboard():
     })
 
 
+@app.route('/api/ig/growth/run-now', methods=['POST'])
+@require_auth
+def ig_growth_run_now():
+    """Fuerza un tick del orquestador inmediato para este owner.
+
+    Útil cuando el usuario acaba de activar Auto y no quiere esperar
+    al cooldown del próximo engagement. Resetea `last_engagement_at`
+    a 1970 (forzando que pase el if del intervalo) y ejecuta un ciclo.
+
+    Rate-limit: solo 1 vez cada 60s para evitar spam.
+    """
+    owner = request.user['username']
+    with get_db() as conn:
+        settings = _ensure_settings_row(conn, owner)
+        if not settings.get('auto_enabled'):
+            return jsonify({'message': 'Auto no está activado.'}), 400
+        # Rate-limit: si lleva <60s desde el último, rechaza.
+        last_eng = settings.get('last_engagement_at')
+        if last_eng:
+            try:
+                last_dt = datetime.datetime.fromisoformat(last_eng.rstrip('Z'))
+                if (datetime.datetime.utcnow() - last_dt).total_seconds() < 60:
+                    return jsonify({
+                        'message': 'Espera ~1 min entre ejecuciones manuales.',
+                    }), 429
+            except Exception:
+                pass
+
+        # Reset de timestamps para forzar el tick
+        conn.execute(
+            "UPDATE ig_growth_settings SET last_engagement_at = NULL, "
+            "last_discovery_at = NULL WHERE owner = ?",
+            (owner,),
+        )
+        conn.commit()
+
+        # Ejecuta el tick directamente sin esperar al thread
+        try:
+            _orchestrate_for_owner(conn, owner)
+            conn.commit()
+        except Exception as e:
+            log.exception('run-now tick failed for %s', owner)
+            return jsonify({'message': f'Error: {e}'}), 500
+
+        # Devolver lo que se ha encolado
+        queued = conn.execute(
+            "SELECT id, type, status, created_at FROM tasks "
+            "WHERE owner = ? AND type IN ('ig_growth_discover','ig_growth_view_stories') "
+            "AND status IN ('queued','running') ORDER BY id DESC LIMIT 5",
+            (owner,),
+        ).fetchall()
+    return jsonify({
+        'ok': True,
+        'queued_or_running': [dict(r) for r in queued],
+    })
+
+
 @app.route('/api/ig/growth/diagnose', methods=['GET'])
 @require_auth
 def ig_growth_diagnose():
