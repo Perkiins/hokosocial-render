@@ -2410,6 +2410,130 @@ def ig_growth_dashboard():
     })
 
 
+@app.route('/api/ig/growth/diagnose', methods=['GET'])
+@require_auth
+def ig_growth_diagnose():
+    """Diagnóstico exhaustivo: por qué el orquestador no encola tasks.
+
+    Devuelve un check-list con razones concretas. Útil cuando "le doy y no
+    pasa nada".
+    """
+    owner = request.user['username']
+    now = datetime.datetime.utcnow()
+    reasons = []
+    with get_db() as conn:
+        settings = _ensure_settings_row(conn, owner)
+        if not settings.get('auto_enabled'):
+            reasons.append({
+                'level': 'high',
+                'code': 'auto_disabled',
+                'message': 'auto_enabled = False. Pulsa "🚀 Encuéntrame seguidoras".',
+            })
+        paused_until = settings.get('paused_until')
+        if paused_until and paused_until > now_iso():
+            reasons.append({
+                'level': 'high',
+                'code': 'paused',
+                'message': f'Orquestador pausado hasta {paused_until}. '
+                           f'Razón: {settings.get("paused_reason") or "desconocida"}.',
+            })
+        in_hours = _is_in_active_hours(
+            settings['active_hours_start'], settings['active_hours_end'],
+        )
+        if not in_hours:
+            reasons.append({
+                'level': 'medium',
+                'code': 'outside_hours',
+                'message': f'Hora actual UTC ({now.hour}h) fuera del rango activo '
+                           f'[{settings["active_hours_start"]}-{settings["active_hours_end"]}). '
+                           'Esperará a entrar en el rango.',
+            })
+
+        sources_enabled = conn.execute(
+            'SELECT COUNT(*) AS n FROM ig_growth_sources WHERE owner = ? AND enabled = 1',
+            (owner,),
+        ).fetchone()['n']
+        if sources_enabled == 0:
+            reasons.append({
+                'level': 'high',
+                'code': 'no_sources',
+                'message': 'No tienes fuentes habilitadas. Añade hashtags/competidores '
+                           'en la pestaña Fuentes (o pulsa "Pre-cargar 12 hashtags semilla").',
+            })
+
+        pending_cands = conn.execute(
+            'SELECT COUNT(*) AS n FROM ig_growth_candidates '
+            'WHERE owner = ? AND status = ? AND score >= ?',
+            (owner, 'pending', settings.get('min_score') or 60),
+        ).fetchone()['n']
+        stories_today = _count_actions_today(conn, owner, 'view_story')
+        cuota = settings.get('daily_view_stories_limit') or 50
+        if stories_today >= cuota:
+            reasons.append({
+                'level': 'info',
+                'code': 'daily_quota_hit',
+                'message': f'Cuota diaria alcanzada ({stories_today}/{cuota}). '
+                           'Reanuda mañana automáticamente.',
+            })
+
+        # ¿Cuándo será el próximo discovery según los timestamps?
+        last_disc_at = settings.get('last_discovery_at') or '1970-01-01T00:00:00Z'
+        try:
+            last_disc_dt = datetime.datetime.fromisoformat(last_disc_at.rstrip('Z'))
+        except Exception:
+            last_disc_dt = datetime.datetime(1970, 1, 1)
+        interval_disc = datetime.timedelta(minutes=settings.get('discovery_interval_minutes') or 180)
+        next_disc_due_in = max(0, int((last_disc_dt + interval_disc - now).total_seconds()))
+
+        last_eng_at = settings.get('last_engagement_at') or '1970-01-01T00:00:00Z'
+        try:
+            last_eng_dt = datetime.datetime.fromisoformat(last_eng_at.rstrip('Z'))
+        except Exception:
+            last_eng_dt = datetime.datetime(1970, 1, 1)
+        interval_eng = datetime.timedelta(minutes=settings.get('engagement_interval_minutes') or 25)
+        next_eng_due_in = max(0, int((last_eng_dt + interval_eng - now).total_seconds()))
+
+        # Lock: ¿quién lo tiene?
+        lock_row = conn.execute(
+            "SELECT holder, lease_until FROM app_locks WHERE name = 'growth_orchestrator'",
+        ).fetchone()
+
+        # Tasks pendientes del owner
+        queued = conn.execute(
+            "SELECT id, type, status, created_at FROM tasks "
+            "WHERE owner = ? AND type IN ('ig_growth_discover','ig_growth_view_stories') "
+            "AND status IN ('queued','running') ORDER BY id ASC",
+            (owner,),
+        ).fetchall()
+
+        # Lista de tasks recientes del owner (10 últimas)
+        recent = conn.execute(
+            "SELECT id, type, status, error, created_at, finished_at FROM tasks "
+            "WHERE owner = ? AND type IN ('ig_growth_discover','ig_growth_view_stories') "
+            "ORDER BY id DESC LIMIT 10",
+            (owner,),
+        ).fetchall()
+
+    return jsonify({
+        'orchestrator': {
+            'disabled_by_env': os.environ.get('GROWTH_ORCHESTRATOR_DISABLED', '').lower() == 'true',
+            'thread_started': _orchestrator_started,
+        },
+        'lock': dict(lock_row) if lock_row else None,
+        'now_utc': now.isoformat() + 'Z',
+        'in_active_hours': in_hours,
+        'sources_enabled': sources_enabled,
+        'pending_candidates_above_min_score': pending_cands,
+        'stories_today': stories_today,
+        'daily_view_stories_limit': cuota,
+        'next_discovery_due_in_seconds': next_disc_due_in,
+        'next_engagement_due_in_seconds': next_eng_due_in,
+        'queued_or_running_tasks': [dict(r) for r in queued],
+        'recent_tasks': [dict(r) for r in recent],
+        'reasons_not_enqueueing': reasons,
+    })
+
+
 @app.route('/api/ig/growth/actions/log', methods=['POST'])
 @require_worker
 def ig_growth_log_action():
