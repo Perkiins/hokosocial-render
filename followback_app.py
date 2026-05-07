@@ -887,16 +887,27 @@ def create_task():
         max_candidates = int(p.get('max_candidates') or 30)
         if max_candidates < 1 or max_candidates > 100:
             return jsonify({'message': 'max_candidates debe estar entre 1 y 100.'}), 400
-        if source_id is not None:
-            with get_db() as conn:
-                row = conn.execute(
-                    'SELECT id FROM ig_growth_sources WHERE id = ? AND owner = ?',
-                    (source_id, request.user['username']),
-                ).fetchone()
-            if not row:
-                return jsonify({'message': 'source_id no encontrado.'}), 404
+        if source_id is None:
+            return jsonify({'message': 'source_id es obligatorio.'}), 400
+        with get_db() as conn:
+            row = conn.execute(
+                'SELECT id, kind, value, niche FROM ig_growth_sources '
+                'WHERE id = ? AND owner = ?',
+                (source_id, request.user['username']),
+            ).fetchone()
+        if not row:
+            return jsonify({'message': 'source_id no encontrado.'}), 404
+        # Enriquecemos el payload con source_detail para que el worker no
+        # necesite hacer una segunda llamada al backend (que requeriría JWT
+        # de usuario, no la worker key).
         payload = {
             'source_id': source_id,
+            'source_detail': {
+                'id': row['id'],
+                'kind': row['kind'],
+                'value': row['value'],
+                'niche': row['niche'],
+            },
             'max_candidates': max_candidates,
             'min_score': int(p.get('min_score') or 0),
         }
