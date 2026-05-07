@@ -2705,6 +2705,29 @@ def _orchestrate_for_owner(conn, owner: str):
             (owner, 'pending', settings.get('min_score') or 60, batch),
         ).fetchall()
         if not cands:
+            # Eager refill: cola vacía → dispara un discovery anticipado
+            # sobre la próxima fuente, ignorando el discovery_interval.
+            # Evita tiempos muertos hasta el siguiente ciclo de descubrimiento.
+            if not _has_pending_growth_task(conn, owner, 'ig_growth_discover'):
+                src = _next_source_round_robin(conn, owner)
+                if src:
+                    _enqueue_task(conn, owner, 'ig_growth_discover', {
+                        'source_id': src['id'],
+                        'source_detail': {
+                            'id': src['id'],
+                            'kind': src['kind'],
+                            'value': src['value'],
+                            'niche': src['niche'],
+                        },
+                        'max_candidates': 30,
+                        'min_score': settings.get('min_score') or 60,
+                    })
+                    conn.execute(
+                        'UPDATE ig_growth_settings SET last_discovery_at = ? WHERE owner = ?',
+                        (now_iso(), owner),
+                    )
+                    log.info('orchestrator: cola vacía → encolé discovery anticipado #%s para %s',
+                             src['id'], owner)
             return
         _enqueue_task(conn, owner, 'ig_growth_view_stories', {
             'candidates': [{
