@@ -49,9 +49,10 @@ DB_PATH = os.environ.get('DB_PATH', 'usuarios.db')
 
 TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile',
               'ig_snapshot', 'footprint_scan', 'ig_growth_discover',
-              'ig_growth_view_stories')
+              'ig_growth_view_stories', 'ig_growth_like', 'ig_growth_follow')
 WORKER_TYPES = ('search', 'followback', 'instagram_profile',
-                'ig_snapshot', 'ig_growth_discover', 'ig_growth_view_stories')
+                'ig_snapshot', 'ig_growth_discover', 'ig_growth_view_stories',
+                'ig_growth_like', 'ig_growth_follow')
 # `footprint_scan` corre en el propio backend (thread), no requiere worker en PC.
 MAX_LOG_LINES = 2000
 WORKER_OFFLINE_AFTER = 30
@@ -253,6 +254,21 @@ def init_db():
         # Migration: añadir engagement_batch_size si la tabla ya existe sin esa col.
         _try_alter(conn, 'ALTER TABLE ig_growth_settings '
                          'ADD COLUMN engagement_batch_size INTEGER NOT NULL DEFAULT 6')
+        # Migrations Fase 3: tracks separados para like y follow
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings '
+                         'ADD COLUMN like_interval_minutes INTEGER NOT NULL DEFAULT 15')
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings '
+                         'ADD COLUMN follow_interval_minutes INTEGER NOT NULL DEFAULT 30')
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings ADD COLUMN last_like_at TEXT')
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings ADD COLUMN last_follow_at TEXT')
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings '
+                         'ADD COLUMN engaged_to_like_hours INTEGER NOT NULL DEFAULT 12')
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings '
+                         'ADD COLUMN liked_to_follow_hours INTEGER NOT NULL DEFAULT 24')
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings '
+                         'ADD COLUMN like_batch_size INTEGER NOT NULL DEFAULT 4')
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings '
+                         'ADD COLUMN follow_batch_size INTEGER NOT NULL DEFAULT 3')
 
         conn.execute('''CREATE TABLE IF NOT EXISTS app_locks (
             name TEXT PRIMARY KEY,
@@ -913,13 +929,12 @@ def create_task():
         if ig_user and not ig_user.replace('.', '').replace('_', '').isalnum():
             return jsonify({'message': 'username de Instagram inválido.'}), 400
         payload = {'username': ig_user} if ig_user else {}
-    elif task_type == 'ig_growth_view_stories':
+    elif task_type in ('ig_growth_view_stories', 'ig_growth_like', 'ig_growth_follow'):
         p = payload or {}
         candidate_ids = p.get('candidate_ids') or []
         if not isinstance(candidate_ids, list) or not candidate_ids:
             return jsonify({'message': 'candidate_ids requerido (lista de ints).'}), 400
         candidate_ids = [int(x) for x in candidate_ids][:20]  # cap a 20 por task
-        # Cargar candidatas (verificando ownership) + IG pks para el worker
         with get_db() as conn:
             placeholders = ','.join('?' for _ in candidate_ids)
             rows = conn.execute(
@@ -2246,6 +2261,12 @@ DEFAULT_SETTINGS = {
     'discovery_interval_minutes': 180,
     'engagement_interval_minutes': 25,
     'engagement_batch_size': 6,
+    'like_interval_minutes': 15,
+    'follow_interval_minutes': 30,
+    'like_batch_size': 4,
+    'follow_batch_size': 3,
+    'engaged_to_like_hours': 12,
+    'liked_to_follow_hours': 24,
     'min_score': 60,
     'active_hours_start': 8,
     'active_hours_end': 23,
@@ -2256,36 +2277,48 @@ def _ensure_settings_row(conn, owner: str) -> dict:
     row = conn.execute('SELECT * FROM ig_growth_settings WHERE owner = ?', (owner,)).fetchone()
     if row:
         return dict(row)
+    cols = (
+        'auto_enabled', 'daily_view_stories_limit', 'daily_follow_limit',
+        'daily_like_limit', 'discovery_interval_minutes', 'engagement_interval_minutes',
+        'engagement_batch_size', 'like_interval_minutes', 'follow_interval_minutes',
+        'like_batch_size', 'follow_batch_size', 'engaged_to_like_hours',
+        'liked_to_follow_hours', 'min_score', 'active_hours_start', 'active_hours_end',
+    )
+    placeholders = ', '.join('?' for _ in cols)
     conn.execute(
-        'INSERT INTO ig_growth_settings '
-        '(owner, auto_enabled, daily_view_stories_limit, daily_follow_limit, '
-        ' daily_like_limit, discovery_interval_minutes, engagement_interval_minutes, '
-        ' engagement_batch_size, min_score, active_hours_start, active_hours_end, updated_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (owner, *[DEFAULT_SETTINGS[k] for k in (
-            'auto_enabled', 'daily_view_stories_limit', 'daily_follow_limit',
-            'daily_like_limit', 'discovery_interval_minutes', 'engagement_interval_minutes',
-            'engagement_batch_size', 'min_score', 'active_hours_start', 'active_hours_end',
-        )], now_iso()),
+        f'INSERT INTO ig_growth_settings (owner, {", ".join(cols)}, updated_at) '
+        f'VALUES (?, {placeholders}, ?)',
+        (owner, *[DEFAULT_SETTINGS[k] for k in cols], now_iso()),
     )
     conn.commit()
     return dict(conn.execute('SELECT * FROM ig_growth_settings WHERE owner = ?', (owner,)).fetchone())
 
 
 def _settings_to_dict(row: dict) -> dict:
+    def _or(key, default):
+        v = row.get(key)
+        return default if v is None else v
     return {
         'auto_enabled': bool(row.get('auto_enabled')),
-        'daily_view_stories_limit': row.get('daily_view_stories_limit'),
-        'daily_follow_limit': row.get('daily_follow_limit'),
-        'daily_like_limit': row.get('daily_like_limit'),
-        'discovery_interval_minutes': row.get('discovery_interval_minutes'),
-        'engagement_interval_minutes': row.get('engagement_interval_minutes'),
-        'engagement_batch_size': row.get('engagement_batch_size') or 6,
-        'min_score': row.get('min_score'),
-        'active_hours_start': row.get('active_hours_start'),
-        'active_hours_end': row.get('active_hours_end'),
+        'daily_view_stories_limit': _or('daily_view_stories_limit', 50),
+        'daily_follow_limit': _or('daily_follow_limit', 30),
+        'daily_like_limit': _or('daily_like_limit', 60),
+        'discovery_interval_minutes': _or('discovery_interval_minutes', 180),
+        'engagement_interval_minutes': _or('engagement_interval_minutes', 25),
+        'engagement_batch_size': _or('engagement_batch_size', 6),
+        'like_interval_minutes': _or('like_interval_minutes', 15),
+        'follow_interval_minutes': _or('follow_interval_minutes', 30),
+        'like_batch_size': _or('like_batch_size', 4),
+        'follow_batch_size': _or('follow_batch_size', 3),
+        'engaged_to_like_hours': _or('engaged_to_like_hours', 12),
+        'liked_to_follow_hours': _or('liked_to_follow_hours', 24),
+        'min_score': _or('min_score', 60),
+        'active_hours_start': _or('active_hours_start', 8),
+        'active_hours_end': _or('active_hours_end', 23),
         'last_discovery_at': row.get('last_discovery_at'),
         'last_engagement_at': row.get('last_engagement_at'),
+        'last_like_at': row.get('last_like_at'),
+        'last_follow_at': row.get('last_follow_at'),
         'paused_until': row.get('paused_until'),
         'paused_reason': row.get('paused_reason'),
     }
@@ -2311,6 +2344,12 @@ def ig_growth_patch_settings():
         'discovery_interval_minutes': lambda v: max(30, min(int(v), 1440)),
         'engagement_interval_minutes': lambda v: max(5, min(int(v), 240)),
         'engagement_batch_size': lambda v: max(1, min(int(v), 20)),
+        'like_interval_minutes': lambda v: max(5, min(int(v), 240)),
+        'follow_interval_minutes': lambda v: max(10, min(int(v), 240)),
+        'like_batch_size': lambda v: max(1, min(int(v), 15)),
+        'follow_batch_size': lambda v: max(1, min(int(v), 10)),
+        'engaged_to_like_hours': lambda v: max(0, min(int(v), 168)),
+        'liked_to_follow_hours': lambda v: max(0, min(int(v), 168)),
         'min_score': lambda v: max(0, min(int(v), 100)),
         'active_hours_start': lambda v: max(0, min(int(v), 23)),
         'active_hours_end': lambda v: max(1, min(int(v), 24)),
@@ -2471,10 +2510,10 @@ def ig_growth_diagnose():
         pending_cands = conn.execute(
             'SELECT COUNT(*) AS n FROM ig_growth_candidates '
             'WHERE owner = ? AND status = ? AND score >= ?',
-            (owner, 'pending', settings.get('min_score') or 60),
+            (owner, 'pending', settings['min_score']),
         ).fetchone()['n']
         stories_today = _count_actions_today(conn, owner, 'view_story')
-        cuota = settings.get('daily_view_stories_limit') or 50
+        cuota = settings['daily_view_stories_limit']
         if stories_today >= cuota:
             reasons.append({
                 'level': 'info',
@@ -2489,7 +2528,7 @@ def ig_growth_diagnose():
             last_disc_dt = datetime.datetime.fromisoformat(last_disc_at.rstrip('Z'))
         except Exception:
             last_disc_dt = datetime.datetime(1970, 1, 1)
-        interval_disc = datetime.timedelta(minutes=settings.get('discovery_interval_minutes') or 180)
+        interval_disc = datetime.timedelta(minutes=settings['discovery_interval_minutes'])
         next_disc_due_in = max(0, int((last_disc_dt + interval_disc - now).total_seconds()))
 
         last_eng_at = settings.get('last_engagement_at') or '1970-01-01T00:00:00Z'
@@ -2497,7 +2536,7 @@ def ig_growth_diagnose():
             last_eng_dt = datetime.datetime.fromisoformat(last_eng_at.rstrip('Z'))
         except Exception:
             last_eng_dt = datetime.datetime(1970, 1, 1)
-        interval_eng = datetime.timedelta(minutes=settings.get('engagement_interval_minutes') or 25)
+        interval_eng = datetime.timedelta(minutes=settings['engagement_interval_minutes'])
         next_eng_due_in = max(0, int((last_eng_dt + interval_eng - now).total_seconds()))
 
         # Lock: ¿quién lo tiene?
@@ -2567,7 +2606,7 @@ def ig_growth_log_action():
         if success and candidate_id:
             new_status = {
                 'view_story': 'engaged',
-                'like': 'engaged',
+                'like': 'liked',
                 'follow': 'followed',
                 'unfollow': 'unfollowed',
             }.get(action)
@@ -2649,7 +2688,8 @@ def _enqueue_task(conn, owner: str, task_type: str, payload: dict, started: bool
 
 
 def _orchestrate_for_owner(conn, owner: str):
-    settings = _ensure_settings_row(conn, owner)
+    raw_settings = _ensure_settings_row(conn, owner)
+    settings = _settings_to_dict(raw_settings)  # normaliza None → defaults
     if not settings.get('auto_enabled'):
         return
     paused_until = settings.get('paused_until')
@@ -2660,7 +2700,7 @@ def _orchestrate_for_owner(conn, owner: str):
 
     # ¿Toca discovery?
     last_disc = settings.get('last_discovery_at') or '1970-01-01T00:00:00Z'
-    interval_disc = datetime.timedelta(minutes=settings.get('discovery_interval_minutes') or 180)
+    interval_disc = datetime.timedelta(minutes=settings['discovery_interval_minutes'])
     try:
         last_disc_dt = datetime.datetime.fromisoformat(last_disc.rstrip('Z'))
     except Exception:
@@ -2679,7 +2719,7 @@ def _orchestrate_for_owner(conn, owner: str):
                         'niche': src['niche'],
                     },
                     'max_candidates': 30,
-                    'min_score': settings.get('min_score') or 60,
+                    'min_score': settings['min_score'],
                 })
                 conn.execute(
                     'UPDATE ig_growth_settings SET last_discovery_at = ? WHERE owner = ?',
@@ -2690,7 +2730,7 @@ def _orchestrate_for_owner(conn, owner: str):
 
     # ¿Toca engagement?
     last_eng = settings.get('last_engagement_at') or '1970-01-01T00:00:00Z'
-    interval_eng = datetime.timedelta(minutes=settings.get('engagement_interval_minutes') or 25)
+    interval_eng = datetime.timedelta(minutes=settings['engagement_interval_minutes'])
     try:
         last_eng_dt = datetime.datetime.fromisoformat(last_eng.rstrip('Z'))
     except Exception:
@@ -2700,17 +2740,17 @@ def _orchestrate_for_owner(conn, owner: str):
             return  # ya hay uno en cola, no solapamos
         # Comprueba cuota
         stories_today = _count_actions_today(conn, owner, 'view_story')
-        if stories_today >= (settings.get('daily_view_stories_limit') or 50):
+        if stories_today >= (settings['daily_view_stories_limit']):
             return
         # Coge top candidatas pending dentro del min_score
-        budget_left = (settings.get('daily_view_stories_limit') or 50) - stories_today
-        batch_size = settings.get('engagement_batch_size') or 6
+        budget_left = (settings['daily_view_stories_limit']) - stories_today
+        batch_size = settings['engagement_batch_size']
         batch = min(budget_left, batch_size)
         cands = conn.execute(
             'SELECT id, ig_pk, ig_username FROM ig_growth_candidates '
             'WHERE owner = ? AND status = ? AND score >= ? '
             'ORDER BY score DESC, discovered_at ASC LIMIT ?',
-            (owner, 'pending', settings.get('min_score') or 60, batch),
+            (owner, 'pending', settings['min_score'], batch),
         ).fetchall()
         if not cands:
             # Eager refill: cola vacía → dispara un discovery anticipado
@@ -2728,7 +2768,7 @@ def _orchestrate_for_owner(conn, owner: str):
                             'niche': src['niche'],
                         },
                         'max_candidates': 30,
-                        'min_score': settings.get('min_score') or 60,
+                        'min_score': settings['min_score'],
                     })
                     conn.execute(
                         'UPDATE ig_growth_settings SET last_discovery_at = ? WHERE owner = ?',
@@ -2750,6 +2790,84 @@ def _orchestrate_for_owner(conn, owner: str):
         )
         log.info('orchestrator: encolé view_stories de %d candidatas para %s',
                  len(cands), owner)
+
+    # === TRACK LIKE: candidatas engaged hace >= engaged_to_like_hours ===
+    last_like = settings.get('last_like_at') or '1970-01-01T00:00:00Z'
+    interval_like = datetime.timedelta(minutes=settings['like_interval_minutes'])
+    try:
+        last_like_dt = datetime.datetime.fromisoformat(last_like.rstrip('Z'))
+    except Exception:
+        last_like_dt = datetime.datetime(1970, 1, 1)
+    if datetime.datetime.utcnow() - last_like_dt >= interval_like:
+        if not _has_pending_growth_task(conn, owner, 'ig_growth_like'):
+            likes_today = _count_actions_today(conn, owner, 'like')
+            like_quota = settings['daily_like_limit']
+            if likes_today < like_quota:
+                like_budget = like_quota - likes_today
+                like_batch = min(like_budget, settings['like_batch_size'])
+                ready_after = (datetime.datetime.utcnow()
+                               - datetime.timedelta(hours=settings['engaged_to_like_hours'])
+                               ).isoformat(timespec='seconds') + 'Z'
+                like_cands = conn.execute(
+                    'SELECT id, ig_pk, ig_username FROM ig_growth_candidates '
+                    'WHERE owner = ? AND status = ? AND score >= ? '
+                    "AND (last_action_at IS NULL OR last_action_at < ?) "
+                    'ORDER BY score DESC, discovered_at ASC LIMIT ?',
+                    (owner, 'engaged', settings['min_score'], ready_after, like_batch),
+                ).fetchall()
+                if like_cands:
+                    _enqueue_task(conn, owner, 'ig_growth_like', {
+                        'candidates': [{
+                            'candidate_id': c['id'],
+                            'ig_pk': c['ig_pk'],
+                            'ig_username': c['ig_username'],
+                        } for c in like_cands],
+                    })
+                    conn.execute(
+                        'UPDATE ig_growth_settings SET last_like_at = ? WHERE owner = ?',
+                        (now_iso(), owner),
+                    )
+                    log.info('orchestrator: encolé like de %d candidatas para %s',
+                             len(like_cands), owner)
+
+    # === TRACK FOLLOW: candidatas liked hace >= liked_to_follow_hours ===
+    last_follow = settings.get('last_follow_at') or '1970-01-01T00:00:00Z'
+    interval_follow = datetime.timedelta(minutes=settings['follow_interval_minutes'])
+    try:
+        last_follow_dt = datetime.datetime.fromisoformat(last_follow.rstrip('Z'))
+    except Exception:
+        last_follow_dt = datetime.datetime(1970, 1, 1)
+    if datetime.datetime.utcnow() - last_follow_dt >= interval_follow:
+        if not _has_pending_growth_task(conn, owner, 'ig_growth_follow'):
+            follows_today = _count_actions_today(conn, owner, 'follow')
+            follow_quota = settings['daily_follow_limit']
+            if follows_today < follow_quota:
+                follow_budget = follow_quota - follows_today
+                follow_batch = min(follow_budget, settings['follow_batch_size'])
+                ready_after = (datetime.datetime.utcnow()
+                               - datetime.timedelta(hours=settings['liked_to_follow_hours'])
+                               ).isoformat(timespec='seconds') + 'Z'
+                follow_cands = conn.execute(
+                    'SELECT id, ig_pk, ig_username FROM ig_growth_candidates '
+                    'WHERE owner = ? AND status = ? AND score >= ? '
+                    "AND (last_action_at IS NULL OR last_action_at < ?) "
+                    'ORDER BY score DESC, discovered_at ASC LIMIT ?',
+                    (owner, 'liked', settings['min_score'], ready_after, follow_batch),
+                ).fetchall()
+                if follow_cands:
+                    _enqueue_task(conn, owner, 'ig_growth_follow', {
+                        'candidates': [{
+                            'candidate_id': c['id'],
+                            'ig_pk': c['ig_pk'],
+                            'ig_username': c['ig_username'],
+                        } for c in follow_cands],
+                    })
+                    conn.execute(
+                        'UPDATE ig_growth_settings SET last_follow_at = ? WHERE owner = ?',
+                        (now_iso(), owner),
+                    )
+                    log.info('orchestrator: encolé follow de %d candidatas para %s',
+                             len(follow_cands), owner)
 
 
 def _orchestrator_tick():
