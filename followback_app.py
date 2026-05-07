@@ -48,9 +48,10 @@ CORS(app, origins=cors_origins, supports_credentials=True)
 DB_PATH = os.environ.get('DB_PATH', 'usuarios.db')
 
 TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile',
-              'ig_snapshot', 'footprint_scan', 'ig_growth_discover')
+              'ig_snapshot', 'footprint_scan', 'ig_growth_discover',
+              'ig_growth_view_stories')
 WORKER_TYPES = ('search', 'followback', 'instagram_profile',
-                'ig_snapshot', 'ig_growth_discover')
+                'ig_snapshot', 'ig_growth_discover', 'ig_growth_view_stories')
 # `footprint_scan` corre en el propio backend (thread), no requiere worker en PC.
 MAX_LOG_LINES = 2000
 WORKER_OFFLINE_AFTER = 30
@@ -227,6 +228,30 @@ def init_db():
                      'ON ig_growth_candidates (owner, status, score DESC)')
         conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_ig_growth_cand_unique '
                      'ON ig_growth_candidates (owner, ig_pk)')
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS ig_growth_settings (
+            owner TEXT PRIMARY KEY,
+            auto_enabled INTEGER NOT NULL DEFAULT 0,
+            daily_view_stories_limit INTEGER NOT NULL DEFAULT 50,
+            daily_follow_limit INTEGER NOT NULL DEFAULT 30,
+            daily_like_limit INTEGER NOT NULL DEFAULT 60,
+            discovery_interval_minutes INTEGER NOT NULL DEFAULT 180,
+            engagement_interval_minutes INTEGER NOT NULL DEFAULT 25,
+            min_score INTEGER NOT NULL DEFAULT 60,
+            active_hours_start INTEGER NOT NULL DEFAULT 8,
+            active_hours_end INTEGER NOT NULL DEFAULT 23,
+            last_discovery_at TEXT,
+            last_engagement_at TEXT,
+            paused_until TEXT,
+            paused_reason TEXT,
+            updated_at TEXT
+        )''')
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS app_locks (
+            name TEXT PRIMARY KEY,
+            holder TEXT,
+            lease_until TEXT
+        )''')
 
         conn.execute('''CREATE TABLE IF NOT EXISTS ig_growth_actions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -881,6 +906,29 @@ def create_task():
         if ig_user and not ig_user.replace('.', '').replace('_', '').isalnum():
             return jsonify({'message': 'username de Instagram inválido.'}), 400
         payload = {'username': ig_user} if ig_user else {}
+    elif task_type == 'ig_growth_view_stories':
+        p = payload or {}
+        candidate_ids = p.get('candidate_ids') or []
+        if not isinstance(candidate_ids, list) or not candidate_ids:
+            return jsonify({'message': 'candidate_ids requerido (lista de ints).'}), 400
+        candidate_ids = [int(x) for x in candidate_ids][:20]  # cap a 20 por task
+        # Cargar candidatas (verificando ownership) + IG pks para el worker
+        with get_db() as conn:
+            placeholders = ','.join('?' for _ in candidate_ids)
+            rows = conn.execute(
+                f'SELECT id, ig_pk, ig_username FROM ig_growth_candidates '
+                f'WHERE owner = ? AND id IN ({placeholders})',
+                [request.user['username']] + candidate_ids,
+            ).fetchall()
+        if not rows:
+            return jsonify({'message': 'Ninguna candidata coincide.'}), 404
+        payload = {
+            'candidates': [{
+                'candidate_id': r['id'],
+                'ig_pk': r['ig_pk'],
+                'ig_username': r['ig_username'],
+            } for r in rows],
+        }
     elif task_type == 'ig_growth_discover':
         p = payload or {}
         source_id = p.get('source_id')
@@ -2181,6 +2229,409 @@ def ig_growth_niche_keywords():
     return jsonify({'niches': NICHE_KEYWORDS})
 
 
+# --- Growth automático (orquestador) ---------------------------------
+
+DEFAULT_SETTINGS = {
+    'auto_enabled': 0,
+    'daily_view_stories_limit': 50,
+    'daily_follow_limit': 30,
+    'daily_like_limit': 60,
+    'discovery_interval_minutes': 180,
+    'engagement_interval_minutes': 25,
+    'min_score': 60,
+    'active_hours_start': 8,
+    'active_hours_end': 23,
+}
+
+
+def _ensure_settings_row(conn, owner: str) -> dict:
+    row = conn.execute('SELECT * FROM ig_growth_settings WHERE owner = ?', (owner,)).fetchone()
+    if row:
+        return dict(row)
+    conn.execute(
+        'INSERT INTO ig_growth_settings '
+        '(owner, auto_enabled, daily_view_stories_limit, daily_follow_limit, '
+        ' daily_like_limit, discovery_interval_minutes, engagement_interval_minutes, '
+        ' min_score, active_hours_start, active_hours_end, updated_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (owner, *[DEFAULT_SETTINGS[k] for k in (
+            'auto_enabled', 'daily_view_stories_limit', 'daily_follow_limit',
+            'daily_like_limit', 'discovery_interval_minutes', 'engagement_interval_minutes',
+            'min_score', 'active_hours_start', 'active_hours_end',
+        )], now_iso()),
+    )
+    conn.commit()
+    return dict(conn.execute('SELECT * FROM ig_growth_settings WHERE owner = ?', (owner,)).fetchone())
+
+
+def _settings_to_dict(row: dict) -> dict:
+    return {
+        'auto_enabled': bool(row.get('auto_enabled')),
+        'daily_view_stories_limit': row.get('daily_view_stories_limit'),
+        'daily_follow_limit': row.get('daily_follow_limit'),
+        'daily_like_limit': row.get('daily_like_limit'),
+        'discovery_interval_minutes': row.get('discovery_interval_minutes'),
+        'engagement_interval_minutes': row.get('engagement_interval_minutes'),
+        'min_score': row.get('min_score'),
+        'active_hours_start': row.get('active_hours_start'),
+        'active_hours_end': row.get('active_hours_end'),
+        'last_discovery_at': row.get('last_discovery_at'),
+        'last_engagement_at': row.get('last_engagement_at'),
+        'paused_until': row.get('paused_until'),
+        'paused_reason': row.get('paused_reason'),
+    }
+
+
+@app.route('/api/ig/growth/settings', methods=['GET'])
+@require_auth
+def ig_growth_get_settings():
+    with get_db() as conn:
+        row = _ensure_settings_row(conn, request.user['username'])
+    return jsonify({'settings': _settings_to_dict(row)})
+
+
+@app.route('/api/ig/growth/settings', methods=['PATCH'])
+@require_auth
+def ig_growth_patch_settings():
+    data = request.get_json(silent=True) or {}
+    allowed = {
+        'auto_enabled': lambda v: 1 if v else 0,
+        'daily_view_stories_limit': lambda v: max(1, min(int(v), 200)),
+        'daily_follow_limit': lambda v: max(0, min(int(v), 150)),
+        'daily_like_limit': lambda v: max(0, min(int(v), 300)),
+        'discovery_interval_minutes': lambda v: max(30, min(int(v), 1440)),
+        'engagement_interval_minutes': lambda v: max(5, min(int(v), 240)),
+        'min_score': lambda v: max(0, min(int(v), 100)),
+        'active_hours_start': lambda v: max(0, min(int(v), 23)),
+        'active_hours_end': lambda v: max(1, min(int(v), 24)),
+    }
+    fields = []
+    values = []
+    for key, conv in allowed.items():
+        if key in data:
+            try:
+                fields.append(f'{key} = ?')
+                values.append(conv(data[key]))
+            except (TypeError, ValueError):
+                return jsonify({'message': f'{key} inválido.'}), 400
+    if not fields:
+        return jsonify({'message': 'Nada que actualizar.'}), 400
+    fields.append('updated_at = ?')
+    values.append(now_iso())
+    with get_db() as conn:
+        _ensure_settings_row(conn, request.user['username'])
+        values.append(request.user['username'])
+        conn.execute(
+            f'UPDATE ig_growth_settings SET {", ".join(fields)} WHERE owner = ?',
+            values,
+        )
+        # Si activamos auto y había paused_until, la limpiamos
+        if data.get('auto_enabled') is True:
+            conn.execute(
+                'UPDATE ig_growth_settings SET paused_until = NULL, paused_reason = NULL '
+                'WHERE owner = ?',
+                (request.user['username'],),
+            )
+        conn.commit()
+        row = conn.execute(
+            'SELECT * FROM ig_growth_settings WHERE owner = ?',
+            (request.user['username'],),
+        ).fetchone()
+    return jsonify({'settings': _settings_to_dict(dict(row))})
+
+
+def _today_iso_start() -> str:
+    """Devuelve YYYY-MM-DDT00:00:00Z (UTC)."""
+    today = datetime.datetime.utcnow().date()
+    return f'{today.isoformat()}T00:00:00Z'
+
+
+def _count_actions_today(conn, owner: str, action: str) -> int:
+    return (conn.execute(
+        'SELECT COUNT(*) AS n FROM ig_growth_actions '
+        'WHERE owner = ? AND action = ? AND created_at >= ? AND success = 1',
+        (owner, action, _today_iso_start()),
+    ).fetchone() or {'n': 0})['n']
+
+
+@app.route('/api/ig/growth/dashboard', methods=['GET'])
+@require_auth
+def ig_growth_dashboard():
+    owner = request.user['username']
+    with get_db() as conn:
+        settings_row = _ensure_settings_row(conn, owner)
+        stories_today = _count_actions_today(conn, owner, 'view_story')
+        follows_today = _count_actions_today(conn, owner, 'follow')
+        likes_today = _count_actions_today(conn, owner, 'like')
+        # Candidatas pendientes y convertidas
+        pending = conn.execute(
+            'SELECT COUNT(*) AS n FROM ig_growth_candidates '
+            'WHERE owner = ? AND status = ? AND score >= ?',
+            (owner, 'pending', settings_row.get('min_score') or 60),
+        ).fetchone()['n']
+        engaged = conn.execute(
+            'SELECT COUNT(*) AS n FROM ig_growth_candidates '
+            'WHERE owner = ? AND status = ?',
+            (owner, 'engaged'),
+        ).fetchone()['n']
+        converted = conn.execute(
+            'SELECT COUNT(*) AS n FROM ig_growth_candidates '
+            'WHERE owner = ? AND status = ?',
+            (owner, 'converted'),
+        ).fetchone()['n']
+        # Próxima task encolada para este owner
+        next_task = conn.execute(
+            "SELECT id, type, status, created_at FROM tasks "
+            "WHERE owner = ? AND type IN ('ig_growth_discover','ig_growth_view_stories') "
+            "AND status IN ('queued','running') "
+            "ORDER BY id ASC LIMIT 1",
+            (owner,),
+        ).fetchone()
+    return jsonify({
+        'settings': _settings_to_dict(dict(settings_row)),
+        'today': {
+            'stories_viewed': stories_today,
+            'follows': follows_today,
+            'likes': likes_today,
+        },
+        'candidates': {
+            'pending_min_score': pending,
+            'engaged': engaged,
+            'converted': converted,
+        },
+        'next_task': dict(next_task) if next_task else None,
+    })
+
+
+@app.route('/api/ig/growth/actions/log', methods=['POST'])
+@require_worker
+def ig_growth_log_action():
+    """Worker reporta acciones individuales (view_story, like, follow...)."""
+    data = request.get_json(silent=True) or {}
+    owner = (data.get('owner') or '').strip()
+    candidate_id = data.get('candidate_id')
+    ig_pk = (data.get('ig_pk') or '').strip()
+    action = (data.get('action') or '').strip()
+    success = 1 if data.get('success', True) else 0
+    error = data.get('error')
+    if not owner or not action:
+        return jsonify({'message': 'Body inválido.'}), 400
+    if action not in ('view_story', 'like', 'follow', 'unfollow', 'comment', 'dm'):
+        return jsonify({'message': f'action inválida: {action}'}), 400
+    with get_db() as conn:
+        conn.execute(
+            'INSERT INTO ig_growth_actions '
+            '(owner, candidate_id, ig_pk, action, success, error, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (owner, candidate_id, ig_pk or None, action, success, error, now_iso()),
+        )
+        # Actualiza el status de la candidata si fue acción exitosa
+        if success and candidate_id:
+            new_status = {
+                'view_story': 'engaged',
+                'like': 'engaged',
+                'follow': 'followed',
+                'unfollow': 'unfollowed',
+            }.get(action)
+            if new_status:
+                conn.execute(
+                    'UPDATE ig_growth_candidates SET status = ?, last_action_at = ? '
+                    'WHERE id = ? AND owner = ?',
+                    (new_status, now_iso(), candidate_id, owner),
+                )
+        conn.commit()
+    return jsonify({'ok': True})
+
+
+# --- Orquestador (thread daemon en cada proceso gunicorn) ------------
+
+def _try_acquire_lock(name: str, ttl_seconds: int = 90) -> bool:
+    """Mutex distribuido vía SQLite. Solo un proceso ejecuta el tick a la vez."""
+    now = datetime.datetime.utcnow()
+    expiry = (now + datetime.timedelta(seconds=ttl_seconds)).isoformat(timespec='seconds') + 'Z'
+    cutoff = now.isoformat(timespec='seconds') + 'Z'
+    holder_id = f'pid={os.getpid()}'
+    with get_db() as conn:
+        # Intenta UPDATE si existe y caducó
+        cur = conn.execute(
+            'UPDATE app_locks SET holder = ?, lease_until = ? '
+            'WHERE name = ? AND (lease_until IS NULL OR lease_until < ?)',
+            (holder_id, expiry, name, cutoff),
+        )
+        if cur.rowcount > 0:
+            conn.commit()
+            return True
+        # Intenta INSERT si no existía
+        try:
+            conn.execute(
+                'INSERT INTO app_locks (name, holder, lease_until) VALUES (?, ?, ?)',
+                (name, holder_id, expiry),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def _is_in_active_hours(start: int, end: int) -> bool:
+    """Hora actual UTC en [start, end). Acepta wraparound (e.g. 22..6)."""
+    h = datetime.datetime.utcnow().hour
+    if start <= end:
+        return start <= h < end
+    return h >= start or h < end  # wrap
+
+
+def _next_source_round_robin(conn, owner: str):
+    """Coge la próxima source enabled (orden: priority asc, last_run_at oldest)."""
+    return conn.execute(
+        "SELECT * FROM ig_growth_sources WHERE owner = ? AND enabled = 1 "
+        "ORDER BY priority ASC, COALESCE(last_run_at, '1970-01-01') ASC LIMIT 1",
+        (owner,),
+    ).fetchone()
+
+
+def _has_pending_growth_task(conn, owner: str, type_: str) -> bool:
+    return bool(conn.execute(
+        "SELECT 1 FROM tasks WHERE owner = ? AND type = ? AND status IN ('queued','running') LIMIT 1",
+        (owner, type_),
+    ).fetchone())
+
+
+def _enqueue_task(conn, owner: str, task_type: str, payload: dict, started: bool = False):
+    """Inserta una task SIN cobrar tokens (uso del orquestador)."""
+    payload_json = json.dumps(payload) if payload else None
+    status = 'running' if started else 'queued'
+    cur = conn.execute(
+        'INSERT INTO tasks (owner, type, status, created_at, payload, started_at) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (owner, task_type, status, now_iso(), payload_json,
+         now_iso() if started else None),
+    )
+    return cur.lastrowid
+
+
+def _orchestrate_for_owner(conn, owner: str):
+    settings = _ensure_settings_row(conn, owner)
+    if not settings.get('auto_enabled'):
+        return
+    paused_until = settings.get('paused_until')
+    if paused_until and paused_until > now_iso():
+        return
+    if not _is_in_active_hours(settings['active_hours_start'], settings['active_hours_end']):
+        return
+
+    # ¿Toca discovery?
+    last_disc = settings.get('last_discovery_at') or '1970-01-01T00:00:00Z'
+    interval_disc = datetime.timedelta(minutes=settings.get('discovery_interval_minutes') or 180)
+    try:
+        last_disc_dt = datetime.datetime.fromisoformat(last_disc.rstrip('Z'))
+    except Exception:
+        last_disc_dt = datetime.datetime(1970, 1, 1)
+    if datetime.datetime.utcnow() - last_disc_dt >= interval_disc:
+        # No solapamos discoveries: si ya hay uno encolado/corriendo, saltamos
+        if not _has_pending_growth_task(conn, owner, 'ig_growth_discover'):
+            src = _next_source_round_robin(conn, owner)
+            if src:
+                _enqueue_task(conn, owner, 'ig_growth_discover', {
+                    'source_id': src['id'],
+                    'source_detail': {
+                        'id': src['id'],
+                        'kind': src['kind'],
+                        'value': src['value'],
+                        'niche': src['niche'],
+                    },
+                    'max_candidates': 30,
+                    'min_score': settings.get('min_score') or 60,
+                })
+                conn.execute(
+                    'UPDATE ig_growth_settings SET last_discovery_at = ? WHERE owner = ?',
+                    (now_iso(), owner),
+                )
+                log.info('orchestrator: encolé discovery #%s para %s sobre %s=%s',
+                         src['id'], owner, src['kind'], src['value'])
+
+    # ¿Toca engagement?
+    last_eng = settings.get('last_engagement_at') or '1970-01-01T00:00:00Z'
+    interval_eng = datetime.timedelta(minutes=settings.get('engagement_interval_minutes') or 25)
+    try:
+        last_eng_dt = datetime.datetime.fromisoformat(last_eng.rstrip('Z'))
+    except Exception:
+        last_eng_dt = datetime.datetime(1970, 1, 1)
+    if datetime.datetime.utcnow() - last_eng_dt >= interval_eng:
+        if _has_pending_growth_task(conn, owner, 'ig_growth_view_stories'):
+            return  # ya hay uno en cola, no solapamos
+        # Comprueba cuota
+        stories_today = _count_actions_today(conn, owner, 'view_story')
+        if stories_today >= (settings.get('daily_view_stories_limit') or 50):
+            return
+        # Coge top candidatas pending dentro del min_score
+        budget_left = (settings.get('daily_view_stories_limit') or 50) - stories_today
+        batch = min(budget_left, 6)  # batch razonable por task (6-10)
+        cands = conn.execute(
+            'SELECT id, ig_pk, ig_username FROM ig_growth_candidates '
+            'WHERE owner = ? AND status = ? AND score >= ? '
+            'ORDER BY score DESC, discovered_at ASC LIMIT ?',
+            (owner, 'pending', settings.get('min_score') or 60, batch),
+        ).fetchall()
+        if not cands:
+            return
+        _enqueue_task(conn, owner, 'ig_growth_view_stories', {
+            'candidates': [{
+                'candidate_id': c['id'],
+                'ig_pk': c['ig_pk'],
+                'ig_username': c['ig_username'],
+            } for c in cands],
+        })
+        conn.execute(
+            'UPDATE ig_growth_settings SET last_engagement_at = ? WHERE owner = ?',
+            (now_iso(), owner),
+        )
+        log.info('orchestrator: encolé view_stories de %d candidatas para %s',
+                 len(cands), owner)
+
+
+def _orchestrator_tick():
+    if not _try_acquire_lock('growth_orchestrator', ttl_seconds=90):
+        return  # otro proceso lo está haciendo
+    with get_db() as conn:
+        owners = conn.execute(
+            'SELECT owner FROM ig_growth_settings WHERE auto_enabled = 1',
+        ).fetchall()
+        for o in owners:
+            try:
+                _orchestrate_for_owner(conn, o['owner'])
+                conn.commit()
+            except Exception:
+                log.exception('orchestrator tick fallo para %s', o['owner'])
+
+
+_orchestrator_started = False
+_orchestrator_lock = threading.Lock()
+
+
+def _orchestrator_loop():
+    log.info('Growth orchestrator started (pid=%d)', os.getpid())
+    while True:
+        try:
+            _orchestrator_tick()
+        except Exception:
+            log.exception('orchestrator loop crashed (continuing)')
+        time.sleep(60)
+
+
+def start_orchestrator():
+    global _orchestrator_started
+    if os.environ.get('GROWTH_ORCHESTRATOR_DISABLED', '').lower() == 'true':
+        log.info('Growth orchestrator disabled by env var.')
+        return
+    with _orchestrator_lock:
+        if _orchestrator_started:
+            return
+        _orchestrator_started = True
+        t = threading.Thread(target=_orchestrator_loop, daemon=True, name='growth-orchestrator')
+        t.start()
+
+
 # --- Digital Footprint ---
 @app.route('/api/footprint/latest', methods=['GET'])
 @require_auth
@@ -2383,6 +2834,7 @@ def server_error(e):
 # Bootstrap se ejecuta tras tener todas las funciones definidas (hash_password,
 # add_transaction). Va al final del módulo a propósito.
 bootstrap_admin()
+start_orchestrator()
 
 
 if __name__ == '__main__':
