@@ -240,6 +240,7 @@ def init_db():
             daily_like_limit INTEGER NOT NULL DEFAULT 60,
             discovery_interval_minutes INTEGER NOT NULL DEFAULT 180,
             engagement_interval_minutes INTEGER NOT NULL DEFAULT 25,
+            engagement_batch_size INTEGER NOT NULL DEFAULT 6,
             min_score INTEGER NOT NULL DEFAULT 60,
             active_hours_start INTEGER NOT NULL DEFAULT 8,
             active_hours_end INTEGER NOT NULL DEFAULT 23,
@@ -249,6 +250,9 @@ def init_db():
             paused_reason TEXT,
             updated_at TEXT
         )''')
+        # Migration: añadir engagement_batch_size si la tabla ya existe sin esa col.
+        _try_alter(conn, 'ALTER TABLE ig_growth_settings '
+                         'ADD COLUMN engagement_batch_size INTEGER NOT NULL DEFAULT 6')
 
         conn.execute('''CREATE TABLE IF NOT EXISTS app_locks (
             name TEXT PRIMARY KEY,
@@ -2241,6 +2245,7 @@ DEFAULT_SETTINGS = {
     'daily_like_limit': 60,
     'discovery_interval_minutes': 180,
     'engagement_interval_minutes': 25,
+    'engagement_batch_size': 6,
     'min_score': 60,
     'active_hours_start': 8,
     'active_hours_end': 23,
@@ -2255,12 +2260,12 @@ def _ensure_settings_row(conn, owner: str) -> dict:
         'INSERT INTO ig_growth_settings '
         '(owner, auto_enabled, daily_view_stories_limit, daily_follow_limit, '
         ' daily_like_limit, discovery_interval_minutes, engagement_interval_minutes, '
-        ' min_score, active_hours_start, active_hours_end, updated_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ' engagement_batch_size, min_score, active_hours_start, active_hours_end, updated_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (owner, *[DEFAULT_SETTINGS[k] for k in (
             'auto_enabled', 'daily_view_stories_limit', 'daily_follow_limit',
             'daily_like_limit', 'discovery_interval_minutes', 'engagement_interval_minutes',
-            'min_score', 'active_hours_start', 'active_hours_end',
+            'engagement_batch_size', 'min_score', 'active_hours_start', 'active_hours_end',
         )], now_iso()),
     )
     conn.commit()
@@ -2275,6 +2280,7 @@ def _settings_to_dict(row: dict) -> dict:
         'daily_like_limit': row.get('daily_like_limit'),
         'discovery_interval_minutes': row.get('discovery_interval_minutes'),
         'engagement_interval_minutes': row.get('engagement_interval_minutes'),
+        'engagement_batch_size': row.get('engagement_batch_size') or 6,
         'min_score': row.get('min_score'),
         'active_hours_start': row.get('active_hours_start'),
         'active_hours_end': row.get('active_hours_end'),
@@ -2304,6 +2310,7 @@ def ig_growth_patch_settings():
         'daily_like_limit': lambda v: max(0, min(int(v), 300)),
         'discovery_interval_minutes': lambda v: max(30, min(int(v), 1440)),
         'engagement_interval_minutes': lambda v: max(5, min(int(v), 240)),
+        'engagement_batch_size': lambda v: max(1, min(int(v), 20)),
         'min_score': lambda v: max(0, min(int(v), 100)),
         'active_hours_start': lambda v: max(0, min(int(v), 23)),
         'active_hours_end': lambda v: max(1, min(int(v), 24)),
@@ -2697,7 +2704,8 @@ def _orchestrate_for_owner(conn, owner: str):
             return
         # Coge top candidatas pending dentro del min_score
         budget_left = (settings.get('daily_view_stories_limit') or 50) - stories_today
-        batch = min(budget_left, 6)  # batch razonable por task (6-10)
+        batch_size = settings.get('engagement_batch_size') or 6
+        batch = min(budget_left, batch_size)
         cands = conn.execute(
             'SELECT id, ig_pk, ig_username FROM ig_growth_candidates '
             'WHERE owner = ? AND status = ? AND score >= ? '
