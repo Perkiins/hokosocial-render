@@ -47,8 +47,10 @@ CORS(app, origins=cors_origins, supports_credentials=True)
 
 DB_PATH = os.environ.get('DB_PATH', 'usuarios.db')
 
-TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile', 'ig_snapshot', 'footprint_scan')
-WORKER_TYPES = ('search', 'followback', 'instagram_profile', 'ig_snapshot')
+TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile',
+              'ig_snapshot', 'footprint_scan', 'ig_growth_discover')
+WORKER_TYPES = ('search', 'followback', 'instagram_profile',
+                'ig_snapshot', 'ig_growth_discover')
 # `footprint_scan` corre en el propio backend (thread), no requiere worker en PC.
 MAX_LOG_LINES = 2000
 WORKER_OFFLINE_AFTER = 30
@@ -178,6 +180,66 @@ def init_db():
         )''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_snap_owner '
                      'ON ig_snapshots (owner, ig_username, taken_at)')
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS ig_growth_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            kind TEXT NOT NULL,           -- 'hashtag' | 'competitor' | 'post'
+            value TEXT NOT NULL,          -- hashtag sin #, username sin @, o shortcode
+            niche TEXT,                   -- 'fitness' | 'gaming' | 'anime' | 'moto' | 'mixed' | NULL
+            priority INTEGER NOT NULL DEFAULT 5,  -- 1=alta, 10=baja
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_run_at TEXT,
+            candidates_found INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_growth_sources_owner '
+                     'ON ig_growth_sources (owner, enabled, priority)')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_ig_growth_sources_unique '
+                     'ON ig_growth_sources (owner, kind, value)')
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS ig_growth_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            ig_pk TEXT NOT NULL,
+            ig_username TEXT NOT NULL,
+            full_name TEXT,
+            profile_pic_url TEXT,
+            biography TEXT,
+            followers_count INTEGER,
+            following_count INTEGER,
+            posts_count INTEGER,
+            is_private INTEGER NOT NULL DEFAULT 0,
+            is_verified INTEGER NOT NULL DEFAULT 0,
+            score INTEGER NOT NULL DEFAULT 0,
+            score_breakdown TEXT,         -- JSON: {key: weight}
+            status TEXT NOT NULL DEFAULT 'pending',
+              -- pending | engaged | followed | unfollowed | converted | skipped | excluded
+            source_id INTEGER,
+            source_kind TEXT,
+            source_value TEXT,
+            niche TEXT,
+            discovered_at TEXT NOT NULL,
+            last_action_at TEXT,
+            FOREIGN KEY(source_id) REFERENCES ig_growth_sources(id)
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_growth_cand_owner '
+                     'ON ig_growth_candidates (owner, status, score DESC)')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_ig_growth_cand_unique '
+                     'ON ig_growth_candidates (owner, ig_pk)')
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS ig_growth_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            candidate_id INTEGER,
+            ig_pk TEXT,
+            action TEXT NOT NULL,         -- view_story | like | follow | unfollow | comment | dm
+            success INTEGER NOT NULL DEFAULT 1,
+            error TEXT,
+            created_at TEXT NOT NULL
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_growth_actions_rate '
+                     'ON ig_growth_actions (owner, action, created_at)')
 
         conn.execute('''CREATE TABLE IF NOT EXISTS footprint_scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -819,6 +881,25 @@ def create_task():
         if ig_user and not ig_user.replace('.', '').replace('_', '').isalnum():
             return jsonify({'message': 'username de Instagram inválido.'}), 400
         payload = {'username': ig_user} if ig_user else {}
+    elif task_type == 'ig_growth_discover':
+        p = payload or {}
+        source_id = p.get('source_id')
+        max_candidates = int(p.get('max_candidates') or 30)
+        if max_candidates < 1 or max_candidates > 100:
+            return jsonify({'message': 'max_candidates debe estar entre 1 y 100.'}), 400
+        if source_id is not None:
+            with get_db() as conn:
+                row = conn.execute(
+                    'SELECT id FROM ig_growth_sources WHERE id = ? AND owner = ?',
+                    (source_id, request.user['username']),
+                ).fetchone()
+            if not row:
+                return jsonify({'message': 'source_id no encontrado.'}), 404
+        payload = {
+            'source_id': source_id,
+            'max_candidates': max_candidates,
+            'min_score': int(p.get('min_score') or 0),
+        }
     elif task_type == 'footprint_scan':
         p = payload or {}
         email = (p.get('email') or '').strip().lower()
@@ -1784,6 +1865,309 @@ def worker_status_endpoint():
         'last_seen': last_seen_str,
         'current_task_id': row['current_task_id'],
     })
+
+
+# --- Instagram Growth (discovery + scoring) ---
+NICHE_KEYWORDS = {
+    'fitness': ['gym', 'fit', 'fitness', 'workout', 'pesas', 'gimnasio', 'pump',
+                'body', 'muscle', 'protein', 'training', 'crossfit', 'yoga',
+                'pilates', 'runner', 'cardio', 'fitspo', 'gainz'],
+    'gaming': ['gamer', 'gaming', 'twitch', 'stream', 'streamer', 'valorant',
+               'fortnite', 'lol', 'csgo', 'overwatch', 'minecraft', 'nintendo',
+               'playstation', 'xbox', 'pc gaming', 'esports'],
+    'anime': ['anime', 'manga', 'otaku', 'weeb', 'cosplay', 'cosplayer',
+              'kawaii', 'japan', 'japon', 'kpop', 'jpop', 'waifu',
+              'genshin', 'honkai'],
+    'moto': ['moto', 'motorbike', 'biker', 'ducati', 'bmw', 'harley',
+             'kawasaki', 'yamaha', 'honda', 'suzuki', 'racing', 'motogp',
+             'cbr', 'triumph', 'enduro', 'tracker', 'cafe racer', 'motera'],
+}
+
+
+def _ig_growth_source_to_dict(row):
+    return {
+        'id': row['id'],
+        'kind': row['kind'],
+        'value': row['value'],
+        'niche': row['niche'],
+        'priority': row['priority'],
+        'enabled': bool(row['enabled']),
+        'last_run_at': row['last_run_at'],
+        'candidates_found': row['candidates_found'],
+        'created_at': row['created_at'],
+    }
+
+
+def _ig_growth_candidate_to_dict(row):
+    breakdown = None
+    if row['score_breakdown']:
+        try:
+            breakdown = json.loads(row['score_breakdown'])
+        except Exception:
+            breakdown = None
+    return {
+        'id': row['id'],
+        'ig_pk': row['ig_pk'],
+        'ig_username': row['ig_username'],
+        'full_name': row['full_name'],
+        'profile_pic_url': row['profile_pic_url'],
+        'biography': row['biography'],
+        'followers_count': row['followers_count'],
+        'following_count': row['following_count'],
+        'posts_count': row['posts_count'],
+        'is_private': bool(row['is_private']),
+        'is_verified': bool(row['is_verified']),
+        'score': row['score'],
+        'score_breakdown': breakdown,
+        'status': row['status'],
+        'source_kind': row['source_kind'],
+        'source_value': row['source_value'],
+        'niche': row['niche'],
+        'discovered_at': row['discovered_at'],
+        'last_action_at': row['last_action_at'],
+    }
+
+
+@app.route('/api/ig/growth/sources', methods=['GET'])
+@require_auth
+def ig_growth_list_sources():
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT * FROM ig_growth_sources WHERE owner = ? '
+            'ORDER BY enabled DESC, priority ASC, created_at DESC',
+            (request.user['username'],),
+        ).fetchall()
+    return jsonify({'sources': [_ig_growth_source_to_dict(r) for r in rows]})
+
+
+@app.route('/api/ig/growth/sources', methods=['POST'])
+@require_auth
+def ig_growth_add_source():
+    data = request.get_json(silent=True) or {}
+    kind = (data.get('kind') or '').strip().lower()
+    value = (data.get('value') or '').strip()
+    if kind not in ('hashtag', 'competitor', 'post'):
+        return jsonify({'message': "kind debe ser 'hashtag', 'competitor' o 'post'."}), 400
+    if kind == 'hashtag':
+        value = value.lstrip('#').lower()
+        if not value or not value.replace('_', '').isalnum():
+            return jsonify({'message': 'hashtag inválido.'}), 400
+    elif kind == 'competitor':
+        value = value.lstrip('@').lower()
+        if not value or not value.replace('.', '').replace('_', '').isalnum():
+            return jsonify({'message': 'username inválido.'}), 400
+    else:  # post
+        if not value or len(value) > 32:
+            return jsonify({'message': 'shortcode inválido.'}), 400
+    niche = (data.get('niche') or '').strip().lower() or None
+    if niche and niche not in NICHE_KEYWORDS and niche != 'mixed':
+        return jsonify({'message': f"niche debe ser uno de: {', '.join(list(NICHE_KEYWORDS) + ['mixed'])}"}), 400
+    priority = int(data.get('priority') or 5)
+    if priority < 1 or priority > 10:
+        return jsonify({'message': 'priority entre 1 y 10.'}), 400
+    enabled = 1 if data.get('enabled', True) else 0
+    with get_db() as conn:
+        try:
+            cur = conn.execute(
+                'INSERT INTO ig_growth_sources '
+                '(owner, kind, value, niche, priority, enabled, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (request.user['username'], kind, value, niche, priority, enabled, now_iso()),
+            )
+            conn.commit()
+            sid = cur.lastrowid
+        except sqlite3.IntegrityError:
+            return jsonify({'message': 'Esta fuente ya existe.'}), 409
+        row = conn.execute('SELECT * FROM ig_growth_sources WHERE id = ?', (sid,)).fetchone()
+    return jsonify({'source': _ig_growth_source_to_dict(row)}), 201
+
+
+@app.route('/api/ig/growth/sources/<int:sid>', methods=['DELETE'])
+@require_auth
+def ig_growth_delete_source(sid):
+    with get_db() as conn:
+        cur = conn.execute(
+            'DELETE FROM ig_growth_sources WHERE id = ? AND owner = ?',
+            (sid, request.user['username']),
+        )
+        conn.commit()
+    if cur.rowcount == 0:
+        return jsonify({'message': 'No encontrada.'}), 404
+    return jsonify({'ok': True})
+
+
+@app.route('/api/ig/growth/sources/<int:sid>', methods=['PATCH'])
+@require_auth
+def ig_growth_patch_source(sid):
+    data = request.get_json(silent=True) or {}
+    fields = []
+    values = []
+    if 'enabled' in data:
+        fields.append('enabled = ?')
+        values.append(1 if data['enabled'] else 0)
+    if 'priority' in data:
+        p = int(data['priority'])
+        if p < 1 or p > 10:
+            return jsonify({'message': 'priority entre 1 y 10.'}), 400
+        fields.append('priority = ?')
+        values.append(p)
+    if 'niche' in data:
+        n = (data['niche'] or '').strip().lower() or None
+        if n and n not in NICHE_KEYWORDS and n != 'mixed':
+            return jsonify({'message': 'niche inválido.'}), 400
+        fields.append('niche = ?')
+        values.append(n)
+    if not fields:
+        return jsonify({'message': 'Nada que actualizar.'}), 400
+    values.extend([sid, request.user['username']])
+    with get_db() as conn:
+        cur = conn.execute(
+            f'UPDATE ig_growth_sources SET {", ".join(fields)} '
+            'WHERE id = ? AND owner = ?',
+            values,
+        )
+        conn.commit()
+    if cur.rowcount == 0:
+        return jsonify({'message': 'No encontrada.'}), 404
+    return jsonify({'ok': True})
+
+
+@app.route('/api/ig/growth/candidates', methods=['GET'])
+@require_auth
+def ig_growth_list_candidates():
+    status = (request.args.get('status') or 'pending').strip()
+    try:
+        min_score = max(0, min(int(request.args.get('min_score', 0)), 100))
+        limit = max(1, min(int(request.args.get('limit', 100)), 500))
+    except ValueError:
+        return jsonify({'message': 'min_score y limit deben ser números.'}), 400
+    where = ['owner = ?', 'score >= ?']
+    args = [request.user['username'], min_score]
+    if status != 'all':
+        where.append('status = ?')
+        args.append(status)
+    args.append(limit)
+    with get_db() as conn:
+        rows = conn.execute(
+            f'SELECT * FROM ig_growth_candidates WHERE {" AND ".join(where)} '
+            'ORDER BY score DESC, discovered_at DESC LIMIT ?',
+            args,
+        ).fetchall()
+    return jsonify({'candidates': [_ig_growth_candidate_to_dict(r) for r in rows]})
+
+
+@app.route('/api/ig/growth/candidates/<int:cid>', methods=['PATCH'])
+@require_auth
+def ig_growth_patch_candidate(cid):
+    data = request.get_json(silent=True) or {}
+    new_status = (data.get('status') or '').strip()
+    if new_status not in ('pending', 'engaged', 'followed', 'unfollowed',
+                          'converted', 'skipped', 'excluded'):
+        return jsonify({'message': 'status inválido.'}), 400
+    with get_db() as conn:
+        cur = conn.execute(
+            'UPDATE ig_growth_candidates SET status = ?, last_action_at = ? '
+            'WHERE id = ? AND owner = ?',
+            (new_status, now_iso(), cid, request.user['username']),
+        )
+        conn.commit()
+    if cur.rowcount == 0:
+        return jsonify({'message': 'No encontrada.'}), 404
+    return jsonify({'ok': True})
+
+
+@app.route('/api/ig/growth/candidates/bulk-upsert', methods=['POST'])
+@require_worker
+def ig_growth_candidates_bulk_upsert():
+    """Endpoint que llama el worker tras descubrir candidatas — hace upsert.
+
+    Body: {owner, source_id, candidates: [...]}.
+    Cada candidate: {ig_pk, ig_username, full_name, profile_pic_url, biography,
+                     followers_count, following_count, posts_count,
+                     is_private, is_verified, score, score_breakdown, niche}
+    """
+    data = request.get_json(silent=True) or {}
+    owner = (data.get('owner') or '').strip()
+    source_id = data.get('source_id')
+    candidates = data.get('candidates') or []
+    if not owner or not isinstance(candidates, list):
+        return jsonify({'message': 'Body inválido.'}), 400
+    inserted = 0
+    updated = 0
+    with get_db() as conn:
+        src = None
+        if source_id:
+            src = conn.execute(
+                'SELECT kind, value, niche FROM ig_growth_sources WHERE id = ?',
+                (source_id,),
+            ).fetchone()
+        for c in candidates:
+            ig_pk = str(c.get('ig_pk') or '')
+            if not ig_pk:
+                continue
+            existing = conn.execute(
+                'SELECT id FROM ig_growth_candidates WHERE owner = ? AND ig_pk = ?',
+                (owner, ig_pk),
+            ).fetchone()
+            breakdown_json = json.dumps(c.get('score_breakdown') or {})
+            if existing:
+                conn.execute(
+                    'UPDATE ig_growth_candidates SET '
+                    'ig_username = ?, full_name = ?, profile_pic_url = ?, biography = ?, '
+                    'followers_count = ?, following_count = ?, posts_count = ?, '
+                    'is_private = ?, is_verified = ?, score = ?, score_breakdown = ?, '
+                    'niche = COALESCE(niche, ?) '
+                    'WHERE id = ?',
+                    (
+                        c.get('ig_username'), c.get('full_name'), c.get('profile_pic_url'),
+                        c.get('biography'),
+                        c.get('followers_count'), c.get('following_count'), c.get('posts_count'),
+                        1 if c.get('is_private') else 0,
+                        1 if c.get('is_verified') else 0,
+                        int(c.get('score') or 0), breakdown_json,
+                        c.get('niche'),
+                        existing['id'],
+                    ),
+                )
+                updated += 1
+            else:
+                conn.execute(
+                    'INSERT INTO ig_growth_candidates '
+                    '(owner, ig_pk, ig_username, full_name, profile_pic_url, biography, '
+                    ' followers_count, following_count, posts_count, '
+                    ' is_private, is_verified, score, score_breakdown, '
+                    ' source_id, source_kind, source_value, niche, discovered_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (
+                        owner, ig_pk, c.get('ig_username'),
+                        c.get('full_name'), c.get('profile_pic_url'), c.get('biography'),
+                        c.get('followers_count'), c.get('following_count'), c.get('posts_count'),
+                        1 if c.get('is_private') else 0,
+                        1 if c.get('is_verified') else 0,
+                        int(c.get('score') or 0), breakdown_json,
+                        source_id,
+                        src['kind'] if src else None,
+                        src['value'] if src else None,
+                        c.get('niche') or (src['niche'] if src else None),
+                        now_iso(),
+                    ),
+                )
+                inserted += 1
+        if source_id:
+            conn.execute(
+                'UPDATE ig_growth_sources SET last_run_at = ?, '
+                'candidates_found = candidates_found + ? '
+                'WHERE id = ?',
+                (now_iso(), inserted, source_id),
+            )
+        conn.commit()
+    return jsonify({'ok': True, 'inserted': inserted, 'updated': updated})
+
+
+@app.route('/api/ig/growth/niche-keywords', methods=['GET'])
+@require_auth
+def ig_growth_niche_keywords():
+    return jsonify({'niches': NICHE_KEYWORDS})
 
 
 # --- Digital Footprint ---
