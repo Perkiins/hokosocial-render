@@ -298,6 +298,7 @@ def init_db():
             target_profile_json TEXT,
             comments_json TEXT NOT NULL DEFAULT '[]',
             tagged_json TEXT NOT NULL DEFAULT '[]',
+            mutuals_json TEXT NOT NULL DEFAULT '[]',
             stats_json TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT,
@@ -305,6 +306,9 @@ def init_db():
         )''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_invest_owner '
                      'ON ig_user_investigations (owner, target_username, created_at)')
+        # Migration: añadir mutuals_json si la tabla ya existía sin esa col.
+        _try_alter(conn, "ALTER TABLE ig_user_investigations "
+                          "ADD COLUMN mutuals_json TEXT NOT NULL DEFAULT '[]'")
 
         conn.execute('''CREATE TABLE IF NOT EXISTS footprint_scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1650,9 +1654,11 @@ def ig_snapshot_status():
     following = json.loads(row['following_json'] or '[]')
     f_map = _by_pk(followers)
     g_map = _by_pk(following)
-    not_back = _sort_users([g_map[pk] for pk in g_map.keys() - f_map.keys()])
-    fans = _sort_users([f_map[pk] for pk in f_map.keys() - g_map.keys()])
-    mutuals = _sort_users([f_map[pk] for pk in f_map.keys() & g_map.keys()])
+    # Mantenemos el orden de IG (más recientes primero en cada lista) en lugar
+    # de orden alfabético. Iteramos las listas originales filtrando por pks.
+    not_back = [u for u in following if u.get('pk') and u['pk'] not in f_map]
+    fans = [u for u in followers if u.get('pk') and u['pk'] not in g_map]
+    mutuals = [u for u in followers if u.get('pk') and u['pk'] in g_map]
     return jsonify({
         'status': {
             'ig_username': row['ig_username'],
@@ -1694,14 +1700,23 @@ def ig_snapshot_diff():
     if len(rows) < 2:
         return jsonify({'diff': None, 'snapshots_available': len(rows)}), 200
     curr, prev = rows[0], rows[1]
-    p_followers = _by_pk(json.loads(prev['followers_json'] or '[]'))
-    c_followers = _by_pk(json.loads(curr['followers_json'] or '[]'))
-    p_following = _by_pk(json.loads(prev['following_json'] or '[]'))
-    c_following = _by_pk(json.loads(curr['following_json'] or '[]'))
-    lost = _sort_users([c_followers.get(pk) or p_followers[pk] for pk in p_followers.keys() - c_followers.keys()])
-    new_f = _sort_users([c_followers[pk] for pk in c_followers.keys() - p_followers.keys()])
-    stopped = _sort_users([p_following[pk] for pk in p_following.keys() - c_following.keys()])
-    started = _sort_users([c_following[pk] for pk in c_following.keys() - p_following.keys()])
+    p_followers_list = json.loads(prev['followers_json'] or '[]')
+    c_followers_list = json.loads(curr['followers_json'] or '[]')
+    p_following_list = json.loads(prev['following_json'] or '[]')
+    c_following_list = json.loads(curr['following_json'] or '[]')
+    p_followers = _by_pk(p_followers_list)
+    c_followers = _by_pk(c_followers_list)
+    p_following = _by_pk(p_following_list)
+    c_following = _by_pk(c_following_list)
+    # Orden cronológico de IG (más recientes primero), iterando listas originales.
+    lost = [u for u in p_followers_list
+            if u.get('pk') and u['pk'] not in c_followers]
+    new_f = [u for u in c_followers_list
+             if u.get('pk') and u['pk'] not in p_followers]
+    stopped = [u for u in p_following_list
+               if u.get('pk') and u['pk'] not in c_following]
+    started = [u for u in c_following_list
+               if u.get('pk') and u['pk'] not in p_following]
     return jsonify({
         'diff': {
             'ig_username': curr['ig_username'],
@@ -1949,15 +1964,16 @@ def _persist_ig_investigation(conn, task_id: int, owner: str, result: dict) -> N
     conn.execute(
         'INSERT INTO ig_user_investigations '
         '(owner, target_username, target_user_id, target_profile_json, '
-        ' comments_json, tagged_json, stats_json, '
+        ' comments_json, tagged_json, mutuals_json, stats_json, '
         ' created_at, finished_at, task_id) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (
             owner, target,
             result.get('user_id'),
             json.dumps(result.get('profile') or {}),
             json.dumps(result.get('comments') or []),
             json.dumps(result.get('tagged') or []),
+            json.dumps(result.get('mutuals') or []),
             json.dumps(result.get('stats') or {}),
             now_iso(), now_iso(), task_id,
         ),
@@ -2001,6 +2017,7 @@ def ig_investigation_get(username):
         'profile': json.loads(row['target_profile_json'] or '{}'),
         'comments': json.loads(row['comments_json'] or '[]'),
         'tagged': json.loads(row['tagged_json'] or '[]'),
+        'mutuals': json.loads(row['mutuals_json'] or '[]'),
         'stats': json.loads(row['stats_json'] or '{}'),
         'created_at': row['created_at'],
         'finished_at': row['finished_at'],
