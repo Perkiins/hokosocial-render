@@ -49,10 +49,11 @@ DB_PATH = os.environ.get('DB_PATH', 'usuarios.db')
 
 TASK_TYPES = ('search', 'followback', 'simulate', 'instagram_profile',
               'ig_snapshot', 'footprint_scan', 'ig_growth_discover',
-              'ig_growth_view_stories', 'ig_growth_like', 'ig_growth_follow')
+              'ig_growth_view_stories', 'ig_growth_like', 'ig_growth_follow',
+              'ig_investigate_user')
 WORKER_TYPES = ('search', 'followback', 'instagram_profile',
                 'ig_snapshot', 'ig_growth_discover', 'ig_growth_view_stories',
-                'ig_growth_like', 'ig_growth_follow')
+                'ig_growth_like', 'ig_growth_follow', 'ig_investigate_user')
 # `footprint_scan` corre en el propio backend (thread), no requiere worker en PC.
 MAX_LOG_LINES = 2000
 WORKER_OFFLINE_AFTER = 30
@@ -288,6 +289,22 @@ def init_db():
         )''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_growth_actions_rate '
                      'ON ig_growth_actions (owner, action, created_at)')
+
+        conn.execute('''CREATE TABLE IF NOT EXISTS ig_user_investigations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            target_username TEXT NOT NULL,
+            target_user_id TEXT,
+            target_profile_json TEXT,
+            comments_json TEXT NOT NULL DEFAULT '[]',
+            tagged_json TEXT NOT NULL DEFAULT '[]',
+            stats_json TEXT,
+            created_at TEXT NOT NULL,
+            finished_at TEXT,
+            task_id INTEGER
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_ig_invest_owner '
+                     'ON ig_user_investigations (owner, target_username, created_at)')
 
         conn.execute('''CREATE TABLE IF NOT EXISTS footprint_scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -951,6 +968,20 @@ def create_task():
                 'ig_username': r['ig_username'],
             } for r in rows],
         }
+    elif task_type == 'ig_investigate_user':
+        p = payload or {}
+        target = (p.get('username') or '').strip().lstrip('@').lower()
+        if not target or not target.replace('.', '').replace('_', '').isalnum():
+            return jsonify({'message': 'username inválido.'}), 400
+        max_following = int(p.get('max_following') or 30)
+        max_posts_per_user = int(p.get('max_posts_per_user') or 5)
+        max_following = max(5, min(max_following, 100))
+        max_posts_per_user = max(1, min(max_posts_per_user, 12))
+        payload = {
+            'username': target,
+            'max_following': max_following,
+            'max_posts_per_user': max_posts_per_user,
+        }
     elif task_type == 'ig_growth_discover':
         p = payload or {}
         source_id = p.get('source_id')
@@ -1055,8 +1086,14 @@ def create_task():
 
 
 def _task_token_cost(task_type: str, payload: dict | None) -> int:
-    """Coste en tokens. footprint_scan con foto cuesta 2 (FaceCheck consume API)."""
+    """Coste en tokens.
+
+    - footprint_scan con foto: 2 (FaceCheck consume API).
+    - ig_investigate_user: 2 (scraping pesado, dura 5-10 min).
+    """
     if task_type == 'footprint_scan' and isinstance(payload, dict) and payload.get('image_b64'):
+        return 2
+    if task_type == 'ig_investigate_user':
         return 2
     return 1
 
@@ -1862,6 +1899,11 @@ def worker_result(task_id):
                 _persist_ig_snapshot(conn, task_id, task_row['owner'], result)
             except Exception:
                 log.exception('No se pudo persistir ig_snapshot del task %s', task_id)
+        if task_row['type'] == 'ig_investigate_user' and isinstance(result, dict):
+            try:
+                _persist_ig_investigation(conn, task_id, task_row['owner'], result)
+            except Exception:
+                log.exception('No se pudo persistir ig_investigation del task %s', task_id)
         conn.commit()
     if cur.rowcount == 0:
         return jsonify({'message': 'Tarea no encontrada'}), 404
@@ -1897,6 +1939,73 @@ def _persist_ig_snapshot(conn, task_id: int, owner: str, result: dict) -> None:
             task_id,
         ),
     )
+
+
+def _persist_ig_investigation(conn, task_id: int, owner: str, result: dict) -> None:
+    """Guarda el resultado de un ig_investigate_user en ig_user_investigations."""
+    target = (result.get('username') or '').strip().lstrip('@').lower()
+    if not target:
+        return
+    conn.execute(
+        'INSERT INTO ig_user_investigations '
+        '(owner, target_username, target_user_id, target_profile_json, '
+        ' comments_json, tagged_json, stats_json, '
+        ' created_at, finished_at, task_id) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (
+            owner, target,
+            result.get('user_id'),
+            json.dumps(result.get('profile') or {}),
+            json.dumps(result.get('comments') or []),
+            json.dumps(result.get('tagged') or []),
+            json.dumps(result.get('stats') or {}),
+            now_iso(), now_iso(), task_id,
+        ),
+    )
+
+
+@app.route('/api/instagram/investigations', methods=['GET'])
+@require_auth
+def ig_investigations_list():
+    with get_db() as conn:
+        rows = conn.execute(
+            'SELECT id, target_username, target_user_id, created_at, task_id, '
+            "json_array_length(comments_json) AS comments_count, "
+            "json_array_length(tagged_json) AS tagged_count "
+            'FROM ig_user_investigations WHERE owner = ? '
+            'ORDER BY created_at DESC LIMIT 50',
+            (request.user['username'],),
+        ).fetchall()
+    return jsonify({'investigations': [dict(r) for r in rows]})
+
+
+@app.route('/api/instagram/investigations/<username>', methods=['GET'])
+@require_auth
+def ig_investigation_get(username):
+    target = (username or '').strip().lstrip('@').lower()
+    if not target:
+        return jsonify({'message': 'username inválido.'}), 400
+    with get_db() as conn:
+        row = conn.execute(
+            'SELECT * FROM ig_user_investigations '
+            'WHERE owner = ? AND target_username = ? '
+            'ORDER BY created_at DESC LIMIT 1',
+            (request.user['username'], target),
+        ).fetchone()
+    if not row:
+        return jsonify({'investigation': None})
+    return jsonify({'investigation': {
+        'id': row['id'],
+        'target_username': row['target_username'],
+        'target_user_id': row['target_user_id'],
+        'profile': json.loads(row['target_profile_json'] or '{}'),
+        'comments': json.loads(row['comments_json'] or '[]'),
+        'tagged': json.loads(row['tagged_json'] or '[]'),
+        'stats': json.loads(row['stats_json'] or '{}'),
+        'created_at': row['created_at'],
+        'finished_at': row['finished_at'],
+        'task_id': row['task_id'],
+    }})
 
 
 @app.route('/api/worker/<int:task_id>/finish', methods=['POST'])
