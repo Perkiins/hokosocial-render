@@ -309,6 +309,11 @@ def init_db():
         # Migration: añadir mutuals_json si la tabla ya existía sin esa col.
         _try_alter(conn, "ALTER TABLE ig_user_investigations "
                           "ADD COLUMN mutuals_json TEXT NOT NULL DEFAULT '[]'")
+        # Migrations: listas reducidas del target (orden cronológico IG)
+        _try_alter(conn, "ALTER TABLE ig_user_investigations "
+                          "ADD COLUMN last_followers_json TEXT NOT NULL DEFAULT '[]'")
+        _try_alter(conn, "ALTER TABLE ig_user_investigations "
+                          "ADD COLUMN last_following_json TEXT NOT NULL DEFAULT '[]'")
 
         conn.execute('''CREATE TABLE IF NOT EXISTS footprint_scans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1964,16 +1969,20 @@ def _persist_ig_investigation(conn, task_id: int, owner: str, result: dict) -> N
     conn.execute(
         'INSERT INTO ig_user_investigations '
         '(owner, target_username, target_user_id, target_profile_json, '
-        ' comments_json, tagged_json, mutuals_json, stats_json, '
+        ' comments_json, tagged_json, mutuals_json, '
+        ' last_followers_json, last_following_json, stats_json, '
         ' created_at, finished_at, task_id) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (
             owner, target,
             result.get('user_id'),
             json.dumps(result.get('profile') or {}),
             json.dumps(result.get('comments') or []),
             json.dumps(result.get('tagged') or []),
-            json.dumps(result.get('mutuals') or []),
+            # Mutuals del target (sus mutuals propios)
+            json.dumps(result.get('last_mutuals') or result.get('mutuals') or []),
+            json.dumps(result.get('last_followers') or []),
+            json.dumps(result.get('last_following') or []),
             json.dumps(result.get('stats') or {}),
             now_iso(), now_iso(), task_id,
         ),
@@ -2017,7 +2026,9 @@ def ig_investigation_get(username):
         'profile': json.loads(row['target_profile_json'] or '{}'),
         'comments': json.loads(row['comments_json'] or '[]'),
         'tagged': json.loads(row['tagged_json'] or '[]'),
-        'mutuals': json.loads(row['mutuals_json'] or '[]'),
+        'last_mutuals': json.loads(row['mutuals_json'] or '[]'),
+        'last_followers': json.loads(row['last_followers_json'] or '[]'),
+        'last_following': json.loads(row['last_following_json'] or '[]'),
         'stats': json.loads(row['stats_json'] or '{}'),
         'created_at': row['created_at'],
         'finished_at': row['finished_at'],
