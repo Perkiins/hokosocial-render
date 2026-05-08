@@ -926,7 +926,7 @@ def create_task():
             if not ig_user or not ig_user.replace('.', '').replace('_', '').isalnum():
                 return jsonify({'message': 'username de Instagram inválido.'}), 400
             payload = {'action': 'profile', 'username': ig_user}
-        elif action in ('feed', 'stories', 'reels', 'followers', 'following'):
+        elif action in ('feed', 'stories', 'reels', 'followers', 'following', 'mutuals'):
             user_id = str((payload or {}).get('user_id') or '').strip()
             if not user_id.isdigit():
                 return jsonify({'message': f'user_id inválido para action={action}.'}), 400
